@@ -6,7 +6,7 @@ LOG_LEVEL ?= raft=info,percolator=info
 
 check:
 	cargo fmt --all -- --check
-	cargo clippy --all --tests -- -D clippy::all
+	cargo clippy --all --tests -- -A clippy::derive_partial_eq_without_eq
 
 test: test_others test_2 test_3
 
