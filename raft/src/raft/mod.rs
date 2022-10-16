@@ -93,7 +93,7 @@ enum Actions {
 
 enum RepliesFrom {
     RequestVoteReplyFrom(u64, RequestVoteReply),
-    AppendEntriesReplyFrom(u64, AppendEntriesReply),
+    AppendEntriesReplyFrom(u64, u64, AppendEntriesReply),
 }
 
 struct ResetTimer;
@@ -115,14 +115,16 @@ pub struct Raft {
     voted_for: i64,
     voters: Vec<u64>,
 
-    // index of the highest log entry, that the majority has commit
-    commit_index: i64,
+    // the index this state machine should commit up to
+    commit_index: u64,
     // index of the highest log entry, that this state machine has applied
-    last_applied: i64,
+    last_applied: u64,
     // index of the next log entry to send to i-th server
-    next_index: Vec<i64>,
+    next_index: Vec<u64>,
     // index of the highest log entry known to be replicated on i-th server
-    match_index: Vec<i64>,
+    match_index: Vec<u64>,
+    // XXX: log
+    log: Vec<LogEntry>,
 
     //todo: send applyMsg to upper layer application, rx is in kvstore
     #[allow(dead_code)]
@@ -144,11 +146,18 @@ macro_rules! rfinfo {
     };
 }
 
-// macro_rules! rferr {
-//     ($rf:expr, $($args:tt)+) => {
-//         error!("rf [me: {}] [state: {:?}], {}", rf.me, rf.state(), format_args!($($arg)+));
-//     };
-// }
+macro_rules! rfpanic {
+    ($raft:expr, $($args:tt)+) => {
+        info!("rf [me: {}] [state: {:?}], {}", $raft.me, $raft.state, format_args!($($args)+));
+        panic!();
+    };
+}
+
+macro_rules! rfwarn {
+    ($raft:expr, $($args:tt)+) => {
+        warn!("rf [me: {}] [state: {:?}], {}", $raft.me, $raft.state, format_args!($($args)+));
+    };
+}
 
 impl Raft {
     /// the service or tester wants to create a Raft server. the ports
@@ -182,6 +191,7 @@ impl Raft {
             match_index: vec![0; npeers],
             next_index: vec![1; npeers],
             // XXX: log entry index start with 1
+            log: vec![],
             action_tx: None,
             reply_tx: None,
             timer_tx: None,
@@ -313,9 +323,14 @@ impl Raft {
 
         // if I have not vote, or I have vote for the sender, I will vote for sender
         if self.vote_for_nobody() || self.voted_for == args.cid as i64 {
-            self.voted_for = args.cid as i64;
-            reply.granted = true;
-            self.reset_timer();
+            if self.candidate_up_to_date(&args) {
+                rfinfo!(self, "votes, candidate {} is up to date", args.cid);
+                // we can vote only to up-to-date candidates
+                self.voted_for = args.cid as i64;
+                reply.granted = true;
+                self.reset_timer();
+            }
+            rfinfo!(self, "do not vote, candidate {} w/ stale log", args.cid);
         }
 
         reply.term = self.term();
@@ -344,11 +359,10 @@ impl Raft {
         &mut self,
         args: AppendEntriesArgs,
     ) -> labrpc::Result<AppendEntriesReply> {
-        let reply = AppendEntriesReply {
+        let mut reply = AppendEntriesReply {
             term: self.state.term(),
             success: false,
         };
-
         if args.term < self.state.term() {
             return Ok(reply);
         }
@@ -356,8 +370,42 @@ impl Raft {
         if args.term > self.state.term() {
             self.turn_follower(args.term, Some(-1));
         }
-
         self.reset_timer();
+
+        // log replication when recv append_entries RPC
+        if !self.is_follower() {
+            rfpanic!(
+                self,
+                "candidate or leader should never recv append_entries by logic"
+            );
+        }
+
+        let matches =
+            self.term_at_logical(args.prev_log_index as usize) == Some(args.prev_log_term);
+        if !matches {
+            reply.success = false;
+        } else {
+            // append logs
+            let mut consistent_with_leader = true;
+            for (i, log) in args.log_entries.iter().enumerate() {
+                // prev = 10, new logs: [11, 12, 13, ....]
+                let logical_index = args.prev_log_index + (i as u64) + 1;
+                if self.term_at_logical(logical_index as usize) != Some(log.term) {
+                    consistent_with_leader = false;
+                }
+            }
+            // if consistent with leader, we don't need to do anything on our logs
+            // if inconsistence with leader, we force it
+            if !consistent_with_leader {
+                while self.last_log_index_logical() > args.prev_log_index {
+                    self.log.pop().unwrap();
+                }
+                args.log_entries
+                    .into_iter()
+                    .for_each(|log| self.log.push(log));
+            }
+            self.update_commit_index(args.leader_commit);
+        }
 
         Ok(reply)
     }
@@ -401,7 +449,6 @@ impl Raft {
         self.state.is_candidate()
     }
 
-    #[allow(dead_code)]
     fn is_follower(&self) -> bool {
         self.state.is_follower()
     }
@@ -417,6 +464,61 @@ impl Raft {
     fn vote_for_nobody(&self) -> bool {
         self.voted_for == -1
     }
+
+    /// returns whether the candidate's log is up to date
+    fn candidate_up_to_date(&self, args: &RequestVoteArgs) -> bool {
+        let my_last_log_term = match self.log.last() {
+            None => 0,
+            Some(e) => e.term,
+        };
+
+        // (term, log.len()) decides the precedence
+        if args.last_log_term > my_last_log_term {
+            return true;
+        } else if args.last_log_term == my_last_log_term {
+            if args.last_log_index >= self.log.len() as u64 {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn index_logical_to_physical(&self, logical_index: usize) -> usize {
+        //todo: - last_included_index
+        logical_index - 1
+    }
+
+    fn term_at_physical(&self, phy_index: usize) -> u64 {
+        self.log[phy_index].term
+    }
+
+    fn term_at_logical(&self, logical_index: usize) -> Option<u64> {
+        let phy_index = self.index_logical_to_physical(logical_index);
+        // log[1, 2, 3] can tolerate physical index 0, 1, 2, not above 3(log.len())
+        if phy_index >= self.log.len() {
+            None
+        } else {
+            Some(self.term_at_physical(phy_index))
+        }
+    }
+
+    /// log: [1, 2, 3] should returns 3
+    ///todo: last_included_index: 5, log[6, 7, 8], returns, lli + len(log)
+    fn last_log_index_logical(&self) -> u64 {
+        self.log.len() as u64
+    }
+
+    /// called after the log is replicated from leader, so last_log_index_logical() represends
+    /// the index of last new entry
+    fn update_commit_index(&mut self, leader_commit: u64) {
+        if leader_commit > self.commit_index {
+            self.commit_index = std::cmp::min(leader_commit, self.last_log_index_logical())
+        }
+    }
+
+    /// advance the commit index to majority's commit index
+    /// and if updated, we try to apply that to state machine
+    fn advance_commit_index_and_apply(&mut self) {}
 }
 
 // actions
@@ -438,6 +540,8 @@ impl Raft {
             prev_log_term: 0,
             log_entries: vec![],
         };
+        // prev: 10, log:[11, 12], next = 13
+        let next_index_on_success = args.prev_log_index + (args.log_entries.len()) as u64 + 1;
 
         for i in 0..self.peers.len() {
             if i == self.me {
@@ -450,8 +554,13 @@ impl Raft {
             self.tp
                 .spawn(async move {
                     let reply = fut.await.unwrap();
+                    // we also need to send the next_index for leader to update
                     reply_tx
-                        .unbounded_send(RepliesFrom::AppendEntriesReplyFrom(i as u64, reply))
+                        .unbounded_send(RepliesFrom::AppendEntriesReplyFrom(
+                            i as u64,
+                            next_index_on_success,
+                            reply,
+                        ))
                         .unwrap()
                 })
                 .unwrap();
@@ -507,8 +616,8 @@ impl Raft {
             RepliesFrom::RequestVoteReplyFrom(peer, reply) => {
                 self.handle_request_vote_reply(peer, reply)
             }
-            RepliesFrom::AppendEntriesReplyFrom(peer, reply) => {
-                self.handle_append_entries_reply(peer, reply)
+            RepliesFrom::AppendEntriesReplyFrom(peer, next, reply) => {
+                self.handle_append_entries_reply(peer, next, reply)
             }
         }
     }
@@ -535,11 +644,29 @@ impl Raft {
             }
         }
     }
-    fn handle_append_entries_reply(&mut self, _from: u64, reply: AppendEntriesReply) {
+    fn handle_append_entries_reply(
+        &mut self,
+        from: u64,
+        next_index: u64,
+        reply: AppendEntriesReply,
+    ) {
         if reply.term > self.term() {
             self.turn_follower(reply.term, Some(-1));
         }
         //todo: handle log
+        if !self.is_leader() {
+            rfwarn!(
+                self,
+                "recv append entries reply from {} when I am not a leader",
+                from
+            );
+            return;
+        }
+        // if success, means that the log sent is replicated on `from`
+        if reply.success {
+            self.next_index[from as usize] = next_index;
+            self.match_index[from as usize] = next_index - 1;
+        }
     }
 }
 
