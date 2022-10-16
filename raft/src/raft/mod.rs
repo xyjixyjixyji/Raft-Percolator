@@ -127,6 +127,9 @@ pub struct Raft {
     // XXX: log
     log: Vec<LogEntry>,
 
+    last_included_index: u64,
+    last_included_term: u64,
+
     //todo: send applyMsg to upper layer application, rx is in kvstore
     #[allow(dead_code)]
     apply_tx: UnboundedSender<ApplyMsg>,
@@ -149,7 +152,7 @@ macro_rules! rfinfo {
 
 macro_rules! rfpanic {
     ($raft:expr, $($args:tt)+) => {
-        info!("rf [me: {}] [state: {:?}], {}", $raft.me, $raft.state, format_args!($($args)+));
+        error!("rf [me: {}] [state: {:?}], {}", $raft.me, $raft.state, format_args!($($args)+));
         panic!();
     };
 }
@@ -193,6 +196,8 @@ impl Raft {
             next_index: vec![1; npeers],
             // XXX: log entry index start with 1
             log: vec![],
+            last_included_index: 0,
+            last_included_term: 0,
             action_tx: None,
             reply_tx: None,
             timer_tx: None,
@@ -377,7 +382,9 @@ impl Raft {
             return Ok(reply);
         }
 
-        if args.term > self.state.term() {
+        if args.term > self.state.term()
+            || (self.role() == Role::Candidate && args.term == self.term())
+        {
             self.turn_follower(args.term, Some(-1));
         }
         self.reset_timer();
@@ -386,13 +393,15 @@ impl Raft {
         if !self.is_follower() {
             rfpanic!(
                 self,
-                "candidate or leader should never recv append_entries by logic"
+                "candidate or leader should never recv append_entries by logic, args: {:?}",
+                args,
             );
         }
 
         // matches the prefix of logs?
         let matches =
             self.term_at_logical(args.prev_log_index as usize) == Some(args.prev_log_term);
+
         if !matches {
             // the prefix is not match, the log has some conflicts...
             reply.success = false;
@@ -400,19 +409,21 @@ impl Raft {
             // provide conflict index for leader
             reply.conflict_index = if self.last_log_index_logical() < args.prev_log_index {
                 self.last_log_index_logical() + 1
-            } else {
+            } else if args.prev_log_index > 0 {
                 // ATTENTION: find the first log has the term of [the term of conflicted log]
                 // since the logs before prev_log_index are thought to be sync
                 let conflict_term = self.term_at_logical(args.prev_log_index as usize).unwrap();
                 // todo(last_included_index)
                 let mut conflict_index = 0;
-                for index in 1..=args.prev_log_index {
+                for index in self.last_included_index + 1..=args.prev_log_index {
                     if self.term_at_logical(index as usize).unwrap() == conflict_term {
                         conflict_index = index;
                         break;
                     }
                 }
                 conflict_index
+            } else {
+                0
             };
         } else {
             // the prefix matches, start replicating logs
@@ -517,61 +528,36 @@ impl Raft {
         false
     }
 
-    fn index_logical_to_physical(&self, logical_index: usize) -> usize {
-        //todo: - last_included_index
-        logical_index - 1
-    }
-
-    fn log_at_physical(&self, phy_index: usize) -> &LogEntry {
-        &self.log[phy_index]
+    fn index_logical_to_physical(&self, logical_index: usize) -> Option<usize> {
+        logical_index.checked_sub(self.last_included_index as usize - 1)
     }
 
     fn log_at_logical(&self, logical_index: usize) -> Option<LogEntry> {
-        let phy_index = self.index_logical_to_physical(logical_index);
-        if phy_index >= self.log.len() {
-            None
-        } else {
-            Some(self.log_at_physical(phy_index).clone())
-        }
-    }
-
-    fn term_at_physical(&self, phy_index: usize) -> u64 {
-        self.log_at_physical(phy_index).term
+        self.index_logical_to_physical(logical_index)
+            .and_then(|p| self.log.get(p).cloned())
     }
 
     fn term_at_logical(&self, logical_index: usize) -> Option<u64> {
-        let phy_index = self.index_logical_to_physical(logical_index);
-        // log[1, 2, 3] can tolerate physical index 0, 1, 2, not above 3(log.len())
-        if phy_index >= self.log.len() {
-            None
-        } else {
-            Some(self.term_at_physical(phy_index))
+        if logical_index == self.last_included_index as usize {
+            return Some(self.last_included_term);
         }
-    }
-
-    fn data_at_physical(&self, phy_index: usize) -> Vec<u8> {
-        self.log_at_physical(phy_index).rb.clone()
+        self.index_logical_to_physical(logical_index)
+            .and_then(|p| self.log.get(p).map(|l| l.term))
     }
 
     fn data_at_logical(&self, logical_index: usize) -> Option<Vec<u8>> {
-        let phy_index = self.index_logical_to_physical(logical_index);
-        if phy_index >= self.log.len() {
-            None
-        } else {
-            Some(self.data_at_physical(phy_index))
-        }
+        self.index_logical_to_physical(logical_index)
+            .and_then(|p| self.log.get(p).map(|l| l.rb.clone()))
     }
 
-    /// log: [1, 2, 3] should returns 3
-    ///todo: last_included_index: 5, log[6, 7, 8], returns, lli + len(log)
     fn last_log_index_logical(&self) -> u64 {
-        self.log.len() as u64
+        self.log.len() as u64 + self.last_included_index
     }
 
     fn last_log_term(&self) -> u64 {
         match self.log.last() {
             Some(l) => l.term,
-            None => 0,
+            None => self.last_included_term,
         }
     }
 
@@ -638,14 +624,22 @@ impl Raft {
         let start_logical = self.next_index[peer as usize];
         let end_logical = self.last_log_index_logical();
         for i in start_logical..=end_logical {
-            log_entries.push(self.log_at_logical(i as usize).unwrap());
+            log_entries.push(self.log_at_logical(i as usize).unwrap_or_else(|| {
+                rfwarn!(self, "next_index: {:?}", self.next_index);
+                panic!("i: {}, start: {}, end: {}", i, start_logical, end_logical,)
+            }));
         }
         let prev_log_index = self.next_index[peer as usize] - 1;
+        let prev_log_term = if prev_log_index == self.last_included_index {
+            self.last_included_term
+        } else {
+            self.term_at_logical(prev_log_index as usize).unwrap()
+        };
         AppendEntriesArgs {
             term: self.term(),
             leader_id: self.me as u64,
             leader_commit: self.commit_index,
-            prev_log_term: self.term_at_logical(prev_log_index as usize).unwrap(),
+            prev_log_term,
             prev_log_index,
             log_entries,
         }
@@ -676,15 +670,16 @@ impl Raft {
 
             self.tp
                 .spawn(async move {
-                    let reply = fut.await.unwrap();
+                    if let Ok(reply) = fut.await {
+                        reply_tx
+                            .unbounded_send(RepliesFrom::AppendEntriesReplyFrom(
+                                i as u64,
+                                next_index_on_success,
+                                reply,
+                            ))
+                            .unwrap()
+                    }
                     // we also need to send the next_index for leader to update
-                    reply_tx
-                        .unbounded_send(RepliesFrom::AppendEntriesReplyFrom(
-                            i as u64,
-                            next_index_on_success,
-                            reply,
-                        ))
-                        .unwrap()
                 })
                 .unwrap();
         }
@@ -790,9 +785,21 @@ impl Raft {
         if reply.success {
             self.next_index[from as usize] = next_index;
             self.match_index[from as usize] = next_index - 1;
+            rfinfo!(
+                self,
+                "AE reply handler: success, next_index: {:?}, match_index: {:?}",
+                self.next_index,
+                self.match_index
+            );
             self.advance_commit_index_and_apply(); // todo
         } else {
             // update the next index based on conflict index
+            rfinfo!(
+                self,
+                "AE reply handler: failed, next_index: {:?}, match_index: {:?}",
+                self.next_index,
+                self.match_index
+            );
             self.next_index[from as usize] = reply.conflict_index;
         }
     }
@@ -911,13 +918,17 @@ impl Node {
                         }
 
                         _ = heartbeat_timer => {
-                            rf.lock().unwrap().action_tx.as_ref().unwrap().unbounded_send(Actions::SendHeartbeat).unwrap();
-                            heartbeat_timer = Node::rebuild_heartbeat_timer();
+                            match rf.lock().unwrap().action_tx.as_ref().unwrap().unbounded_send(Actions::SendHeartbeat) {
+                                Ok(_) => heartbeat_timer = Node::rebuild_heartbeat_timer(),
+                                _ => break,
+                            }
                         }
 
                         _ = timeout_timer => {
-                            rf.lock().unwrap().action_tx.as_ref().unwrap().unbounded_send(Actions::StartElection).unwrap();
-                            timeout_timer = Node::rebuild_timeout_timer();
+                            match rf.lock().unwrap().action_tx.as_ref().unwrap().unbounded_send(Actions::StartElection) {
+                                Ok(_) => timeout_timer = Node::rebuild_timeout_timer(),
+                                _ => break,
+                            }
                         }
                     }
                 }
