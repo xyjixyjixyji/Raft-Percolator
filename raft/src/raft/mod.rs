@@ -110,18 +110,28 @@ pub struct Raft {
     // Your data here (2A, 2B, 2C).
     // Look at the paper's Figure 2 for a description of what
     // state a Raft server must maintain.
+
+    // vote infos
     voted_for: i64,
     voters: Vec<u64>,
 
-    // channel
-    // send applyMsg to upper layer application, rx is in kvstore
+    // index of the highest log entry, that the majority has commit
+    commit_index: i64,
+    // index of the highest log entry, that this state machine has applied
+    last_applied: i64,
+    // index of the next log entry to send to i-th server
+    next_index: Vec<i64>,
+    // index of the highest log entry known to be replicated on i-th server
+    match_index: Vec<i64>,
+
+    //todo: send applyMsg to upper layer application, rx is in kvstore
     #[allow(dead_code)]
     apply_tx: UnboundedSender<ApplyMsg>,
     // send regular actions, rx is in loop, tx in send_actions
     action_tx: Option<UnboundedSender<Actions>>,
     // send reply handler messages to invoke reply handlers
     reply_tx: Option<UnboundedSender<RepliesFrom>>,
-    // reset timer channel
+    // reset timer channel, reset upon recv
     timer_tx: Option<UnboundedSender<ResetTimer>>,
 
     // thread pool, simulate go runtime
@@ -158,6 +168,7 @@ impl Raft {
         let raft_state = persister.raft_state();
 
         // Your initialization code here (2A, 2B, 2C).
+        let npeers = peers.len();
         let mut rf = Raft {
             peers,
             persister,
@@ -165,6 +176,12 @@ impl Raft {
             state: State::default(),
             voted_for: -1,
             voters: vec![],
+            // XXX: log entry index start with 1
+            commit_index: 0,
+            last_applied: 0,
+            match_index: vec![0; npeers],
+            next_index: vec![1; npeers],
+            // XXX: log entry index start with 1
             action_tx: None,
             reply_tx: None,
             timer_tx: None,
