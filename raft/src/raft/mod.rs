@@ -1,4 +1,5 @@
 use futures::channel::mpsc::UnboundedSender;
+use futures::channel::oneshot;
 use futures::future::Fuse;
 use futures::task::SpawnExt;
 use futures::{select, FutureExt, StreamExt};
@@ -792,24 +793,27 @@ pub struct Node {
     // Your code here.
     rf: Arc<Mutex<Raft>>,
     tp: futures::executor::ThreadPool,
+    kill_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>, // fuck checker.....
 }
 
 impl Node {
     /// Create a new raft service.
     pub fn new(raft: Raft) -> Node {
         // Your code here.
+        let (kill_tx, kill_rx) = oneshot::channel();
         let mut node = Node {
             rf: Arc::new(Mutex::new(raft)),
             tp: futures::executor::ThreadPool::new().unwrap(),
+            kill_tx: Arc::new(Mutex::new(Some(kill_tx))),
         };
 
         node.timer();
-        node.run();
+        node.run(kill_rx.fuse());
 
         node
     }
 
-    fn run(&mut self) {
+    fn run(&mut self, mut kill_rx: Fuse<oneshot::Receiver<()>>) {
         let (action_tx, mut action_rx) = futures::channel::mpsc::unbounded();
         let (reply_tx, mut reply_rx) = futures::channel::mpsc::unbounded();
 
@@ -834,6 +838,10 @@ impl Node {
 
                         reply = reply_rx.select_next_some() => {
                             rf.lock().unwrap().mux_replies(reply);
+                        }
+
+                        _ = kill_rx => {
+                            break;
                         }
                     }
                 }
@@ -947,6 +955,8 @@ impl Node {
     /// threads you generated with this Raft Node.
     pub fn kill(&self) {
         // Your code here, if desired.
+        let kill_tx = self.kill_tx.lock().unwrap().take().unwrap();
+        kill_tx.send(()).unwrap();
     }
 
     /// A service wants to switch to snapshot.  
