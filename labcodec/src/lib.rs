@@ -1,4 +1,5 @@
 //! A thin wrapper of [prost](https://docs.rs/prost/0.6.1/prost/)
+#![allow(clippy::derive_partial_eq_without_eq)]
 
 /// A labcodec message.
 pub trait Message: prost::Message + Default {}

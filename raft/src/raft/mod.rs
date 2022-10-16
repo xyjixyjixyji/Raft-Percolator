@@ -236,22 +236,30 @@ impl Raft {
         // }
     }
 
-    fn start<M>(&self, command: &M) -> Result<(u64, u64)>
+    fn start<M>(&mut self, command: &M) -> Result<(u64, u64)>
     where
         M: labcodec::Message,
     {
-        let index = 0;
-        let term = 0;
-        let is_leader = true;
         let mut buf = vec![];
         labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
         // Your code here (2B).
-
-        if is_leader {
-            Ok((index, term))
-        } else {
-            Err(Error::NotLeader)
+        if !self.is_leader() {
+            return Err(Error::NotLeader);
         }
+
+        let entry = LogEntry {
+            term: self.term(),
+            rb: buf,
+        };
+        rfinfo!(
+            self,
+            "pushing log {:?} into the log at index {}",
+            &entry,
+            self.last_log_index_logical() + 1, // fuck checker
+        );
+        self.log.push(entry);
+        self.reset_timer();
+        Ok((self.last_log_index_logical(), self.last_log_term()))
     }
 
     fn cond_install_snapshot(
@@ -498,14 +506,15 @@ impl Raft {
         };
 
         // (term, log.len()) decides the precedence
-        if args.last_log_term > my_last_log_term {
+        let cond1 = args.last_log_term > my_last_log_term;
+        let cond2 = args.last_log_term == my_last_log_term
+            && args.last_log_index >= (self.log.len() as u64);
+
+        if cond1 || cond2 {
             return true;
-        } else if args.last_log_term == my_last_log_term {
-            if args.last_log_index >= self.log.len() as u64 {
-                return true;
-            }
         }
-        return false;
+
+        false
     }
 
     fn index_logical_to_physical(&self, logical_index: usize) -> usize {
@@ -513,8 +522,21 @@ impl Raft {
         logical_index - 1
     }
 
+    fn log_at_physical(&self, phy_index: usize) -> &LogEntry {
+        &self.log[phy_index]
+    }
+
+    fn log_at_logical(&self, logical_index: usize) -> Option<LogEntry> {
+        let phy_index = self.index_logical_to_physical(logical_index);
+        if phy_index >= self.log.len() {
+            None
+        } else {
+            Some(self.log_at_physical(phy_index).clone())
+        }
+    }
+
     fn term_at_physical(&self, phy_index: usize) -> u64 {
-        self.log[phy_index].term
+        self.log_at_physical(phy_index).term
     }
 
     fn term_at_logical(&self, logical_index: usize) -> Option<u64> {
@@ -528,7 +550,7 @@ impl Raft {
     }
 
     fn data_at_physical(&self, phy_index: usize) -> Vec<u8> {
-        self.log[phy_index].rb.clone()
+        self.log_at_physical(phy_index).rb.clone()
     }
 
     fn data_at_logical(&self, logical_index: usize) -> Option<Vec<u8>> {
@@ -544,6 +566,13 @@ impl Raft {
     ///todo: last_included_index: 5, log[6, 7, 8], returns, lli + len(log)
     fn last_log_index_logical(&self) -> u64 {
         self.log.len() as u64
+    }
+
+    fn last_log_term(&self) -> u64 {
+        match self.log.last() {
+            Some(l) => l.term,
+            None => 0,
+        }
     }
 
     /// called after the log is replicated from leader, so last_log_index_logical() represends
@@ -566,11 +595,11 @@ impl Raft {
             }
             // there exists an N, > commit index, majority of matchIndex >== N
             // and log[N].term == currentTerm, set commitIndex = N
-            if nmatches > self.peers.len() / 2 {
-                if self.term_at_logical(i as usize) == Some(self.term()) {
-                    n = i;
-                    break;
-                }
+            if nmatches > self.peers.len() / 2
+                && self.term_at_logical(i as usize) == Some(self.term())
+            {
+                n = i;
+                break;
             }
         }
         n
@@ -603,6 +632,24 @@ impl Raft {
         self.commit_index = self.valid_commit_index_from_majority();
         self.apply();
     }
+
+    fn append_entries_args_for(&self, peer: u64) -> AppendEntriesArgs {
+        let mut log_entries = vec![];
+        let start_logical = self.next_index[peer as usize];
+        let end_logical = self.last_log_index_logical();
+        for i in start_logical..=end_logical {
+            log_entries.push(self.log_at_logical(i as usize).unwrap());
+        }
+        let prev_log_index = self.next_index[peer as usize] - 1;
+        AppendEntriesArgs {
+            term: self.term(),
+            leader_id: self.me as u64,
+            leader_commit: self.commit_index,
+            prev_log_term: self.term_at_logical(prev_log_index as usize).unwrap(),
+            prev_log_index,
+            log_entries,
+        }
+    }
 }
 
 // actions
@@ -615,22 +662,14 @@ impl Raft {
 
         rfinfo!(self, "Sending heartbeat");
 
-        let args = AppendEntriesArgs {
-            term: self.state.term(),
-            leader_id: self.me as u64,
-            //todos: log entries should be piggybacked in HB
-            leader_commit: 0,
-            prev_log_index: 0,
-            prev_log_term: 0,
-            log_entries: vec![],
-        };
         // prev: 10, log:[11, 12], next = 13
-        let next_index_on_success = args.prev_log_index + (args.log_entries.len()) as u64 + 1;
-
         for i in 0..self.peers.len() {
             if i == self.me {
                 continue;
             }
+
+            let args = self.append_entries_args_for(i as u64);
+            let next_index_on_success = args.prev_log_index + (args.log_entries.len()) as u64 + 1;
 
             let fut = self.peers[i].append_entries(&args);
             let reply_tx = self.reply_tx.as_ref().unwrap().clone();
@@ -661,7 +700,8 @@ impl Raft {
         let args = RequestVoteArgs {
             term: self.term(),
             cid: self.me as u64,
-            ..Default::default()
+            last_log_index: self.last_log_index_logical(),
+            last_log_term: self.last_log_term(),
         };
 
         for i in 0..self.peers.len() {
@@ -913,7 +953,7 @@ impl Node {
         // Your code here.
         // Example:
         // self.raft.start(command)
-        let rf = self.rf.lock().unwrap();
+        let mut rf = self.rf.lock().unwrap();
         rf.start(command)
     }
 

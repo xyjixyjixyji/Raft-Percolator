@@ -1,4 +1,5 @@
 #![allow(clippy::new_without_default)]
+#![allow(clippy::derive_partial_eq_without_eq)]
 
 mod client;
 mod error;
