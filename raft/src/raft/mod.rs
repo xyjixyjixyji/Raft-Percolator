@@ -1,10 +1,13 @@
 use futures::channel::mpsc::UnboundedSender;
-// use futures::select;
+use futures::future::Fuse;
 use futures::task::SpawnExt;
+use futures::{select, FutureExt, StreamExt};
+use futures_timer::Delay;
 use rand::Rng;
 use std::sync::mpsc::{sync_channel, Receiver};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 
 #[cfg(test)]
 pub mod config;
@@ -16,6 +19,9 @@ mod tests;
 use self::errors::*;
 use self::persister::*;
 use crate::proto::raftpb::*;
+
+const HEARTBEAT_INTERVAL: u64 = 100;
+const TIMEOUT_MIN: u64 = 200;
 
 /// As each Raft peer becomes aware that successive log entries are committed,
 /// the peer should send an `ApplyMsg` to the service (or tester) on the same
@@ -33,12 +39,23 @@ pub enum ApplyMsg {
     },
 }
 
-#[derive(Debug, PartialEq, Clone, Copy, Default)]
+#[derive(PartialEq, Clone, Copy, Default)]
 pub enum Role {
     #[default]
     Follower,
     Candidate,
     Leader,
+}
+
+impl std::fmt::Debug for Role {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ident = match self {
+            Role::Follower => "Follower",
+            Role::Candidate => "Candidate",
+            Role::Leader => "Leader",
+        };
+        write!(f, "{}", ident)
+    }
 }
 
 /// State of a raft peer.
@@ -62,22 +79,24 @@ impl State {
         self.role == Role::Candidate
     }
 
+    #[allow(dead_code)]
     pub fn is_follower(&self) -> bool {
         self.role == Role::Follower
     }
 }
 
-// regular events
-enum Events {
-    Heartbeat,
-    ElecTimeout,
-    ResetTimer,
+// regular actions
+enum Actions {
+    SendHeartbeat,
+    StartElection,
 }
 
 enum RepliesFrom {
     RequestVoteReplyFrom(u64, RequestVoteReply),
     AppendEntriesReplyFrom(u64, AppendEntriesReply),
 }
+
+struct ResetTimer;
 
 // A single Raft peer.
 pub struct Raft {
@@ -92,21 +111,34 @@ pub struct Raft {
     // Look at the paper's Figure 2 for a description of what
     // state a Raft server must maintain.
     voted_for: i64,
-
-    // timeout limit, used to build timer
-    timeout_limit: u128,
+    voters: Vec<u64>,
 
     // channel
     // send applyMsg to upper layer application, rx is in kvstore
+    #[allow(dead_code)]
     apply_tx: UnboundedSender<ApplyMsg>,
-    // send regular events, rx is in loop, tx in send_events
-    event_tx: Option<UnboundedSender<Events>>,
+    // send regular actions, rx is in loop, tx in send_actions
+    action_tx: Option<UnboundedSender<Actions>>,
     // send reply handler messages to invoke reply handlers
     reply_tx: Option<UnboundedSender<RepliesFrom>>,
+    // reset timer channel
+    timer_tx: Option<UnboundedSender<ResetTimer>>,
 
     // thread pool, simulate go runtime
     tp: futures::executor::ThreadPool,
 }
+
+macro_rules! rfinfo {
+    ($raft:expr, $($args:tt)+) => {
+        info!("rf [me: {}] [state: {:?}], {}", $raft.me, $raft.state, format_args!($($args)+));
+    };
+}
+
+// macro_rules! rferr {
+//     ($rf:expr, $($args:tt)+) => {
+//         error!("rf [me: {}] [state: {:?}], {}", rf.me, rf.state(), format_args!($($arg)+));
+//     };
+// }
 
 impl Raft {
     /// the service or tester wants to create a Raft server. the ports
@@ -132,17 +164,18 @@ impl Raft {
             me,
             state: State::default(),
             voted_for: -1,
-            timeout_limit: 0,
-            event_tx: None,
+            voters: vec![],
+            action_tx: None,
             reply_tx: None,
+            timer_tx: None,
             apply_tx: apply_ch,
             tp: futures::executor::ThreadPool::new().unwrap(),
         };
 
         // initialize from state persisted before a crash
         rf.restore(&raft_state);
-        rf.reset_timer_info();
 
+        rfinfo!(rf, "raft::new() called");
         rf
     }
 
@@ -174,9 +207,6 @@ impl Raft {
         //     }
         // }
     }
-
-    /// loop of a raft instance
-    fn run() {}
 
     fn start<M>(&self, command: &M) -> Result<(u64, u64)>
     where
@@ -248,7 +278,7 @@ impl Raft {
     }
 
     // Node::request_vote directs to here, handler
-    fn request_vote(&mut self, args: RequestVoteArgs) -> labrpc::Result<RequestVoteReply> {
+    fn request_vote_handler(&mut self, args: RequestVoteArgs) -> labrpc::Result<RequestVoteReply> {
         let mut reply = RequestVoteReply {
             term: self.state.term(),
             granted: false,
@@ -271,6 +301,8 @@ impl Raft {
             self.reset_timer();
         }
 
+        reply.term = self.term();
+
         Ok(reply)
     }
 
@@ -291,7 +323,10 @@ impl Raft {
         rx
     }
 
-    fn append_entries(&mut self, args: AppendEntriesArgs) -> labrpc::Result<AppendEntriesReply> {
+    fn append_entries_handler(
+        &mut self,
+        args: AppendEntriesArgs,
+    ) -> labrpc::Result<AppendEntriesReply> {
         let reply = AppendEntriesReply {
             term: self.state.term(),
             success: false,
@@ -313,24 +348,18 @@ impl Raft {
 
 // utils
 impl Raft {
-    fn reset_timer_info(&mut self) {
-        let mut rng = rand::thread_rng();
-        // timeout: [150, 300)
-        self.timeout_limit = rng.gen_range(0, 150) + 150;
-    }
-
     fn reset_timer(&mut self) {
-        self.reset_timer_info();
-        self.event_tx
+        self.timer_tx
             .as_ref()
             .unwrap()
-            .unbounded_send(Events::ResetTimer)
+            .unbounded_send(ResetTimer)
             .unwrap();
     }
 
     fn turn_follower(&mut self, new_term: u64, voted_for: Option<i64>) {
         self.state.role = Role::Follower;
         self.state.term = new_term;
+        self.voters = vec![];
         if let Some(v) = voted_for {
             self.voted_for = v;
         }
@@ -339,6 +368,7 @@ impl Raft {
     fn turn_candidate(&mut self) {
         self.state.role = Role::Candidate;
         self.state.term += 1;
+        self.voters = vec![self.me as u64];
         self.voted_for = self.me as i64;
     }
 
@@ -354,6 +384,7 @@ impl Raft {
         self.state.is_candidate()
     }
 
+    #[allow(dead_code)]
     fn is_follower(&self) -> bool {
         self.state.is_follower()
     }
@@ -373,11 +404,13 @@ impl Raft {
 
 // actions
 impl Raft {
-    // poll from main loop, call this as handler when event_chan has a hb request
+    // poll from main loop, call this as handler when action_chan has a hb request
     fn send_heartbeat(&mut self) {
         if !self.is_leader() {
             return;
         }
+
+        rfinfo!(self, "Sending heartbeat");
 
         let args = AppendEntriesArgs {
             term: self.state.term(),
@@ -395,10 +428,14 @@ impl Raft {
             }
 
             let fut = self.peers[i].append_entries(&args);
+            let reply_tx = self.reply_tx.as_ref().unwrap().clone();
 
             self.tp
                 .spawn(async move {
-                    fut.await.unwrap();
+                    let reply = fut.await.unwrap();
+                    reply_tx
+                        .unbounded_send(RepliesFrom::AppendEntriesReplyFrom(i as u64, reply))
+                        .unwrap()
                 })
                 .unwrap();
         }
@@ -408,6 +445,7 @@ impl Raft {
         if self.is_leader() {
             return;
         }
+        rfinfo!(self, "starting election");
         self.turn_candidate();
 
         let args = RequestVoteArgs {
@@ -438,10 +476,54 @@ impl Raft {
     }
 }
 
-// reply handlers
+// handlers
 impl Raft {
-    fn handle_request_vote_reply(&mut self, reply: RequestVoteReply) {}
-    fn handle_append_entries_reply(&mut self, reply: AppendEntriesReply) {}
+    fn mux_actions(&mut self, action: Actions) {
+        match action {
+            Actions::StartElection => self.start_election(),
+            Actions::SendHeartbeat => self.send_heartbeat(),
+        }
+    }
+
+    fn mux_replies(&mut self, reply_from: RepliesFrom) {
+        match reply_from {
+            RepliesFrom::RequestVoteReplyFrom(peer, reply) => {
+                self.handle_request_vote_reply(peer, reply)
+            }
+            RepliesFrom::AppendEntriesReplyFrom(peer, reply) => {
+                self.handle_append_entries_reply(peer, reply)
+            }
+        }
+    }
+
+    /// this is for election, after we send
+    fn handle_request_vote_reply(&mut self, from: u64, reply: RequestVoteReply) {
+        rfinfo!(self, "handling RV reply, reply: {:?}", reply);
+        if reply.term > self.term() {
+            self.turn_follower(reply.term, Some(-1));
+        }
+
+        if !self.is_candidate() {
+            return;
+        }
+
+        if reply.term == self.term() && reply.granted {
+            if !self.voters.contains(&from) {
+                self.voters.push(from);
+            }
+
+            if self.voters.len() > self.peers.len() / 2 {
+                self.turn_leader();
+                self.send_heartbeat();
+            }
+        }
+    }
+    fn handle_append_entries_reply(&mut self, _from: u64, reply: AppendEntriesReply) {
+        if reply.term > self.term() {
+            self.turn_follower(reply.term, Some(-1));
+        }
+        //todo: handle log
+    }
 }
 
 impl Raft {
@@ -451,7 +533,7 @@ impl Raft {
         let _ = self.start(&0);
         let _ = self.cond_install_snapshot(0, 0, &[]);
         self.snapshot(0, &[]);
-        let _ = self.send_request_vote(0, Default::default());
+        // let _ = self.send_request_vote(0, Default::default());
         self.persist();
         let _ = &self.state;
         let _ = &self.me;
@@ -485,17 +567,92 @@ impl Node {
     /// Create a new raft service.
     pub fn new(raft: Raft) -> Node {
         // Your code here.
-        Self {
+        let mut node = Node {
             rf: Arc::new(Mutex::new(raft)),
             tp: futures::executor::ThreadPool::new().unwrap(),
-        }
+        };
+
+        node.timer();
+        node.run();
+
+        node
     }
 
-    fn run(&self) {
-        loop {
-            // poll from channels' rx
-            self.tp.spawn(async move {}).unwrap();
-        }
+    fn run(&mut self) {
+        let (action_tx, mut action_rx) = futures::channel::mpsc::unbounded();
+        let (reply_tx, mut reply_rx) = futures::channel::mpsc::unbounded();
+
+        // when raft needs to handle replies or actions, it sends to these channel, then,
+        // the loop polls from these channels and call corresponding handlers
+        let mut rf = self.rf.lock().unwrap();
+        rf.action_tx = Some(action_tx);
+        rf.reply_tx = Some(reply_tx);
+        rf.reset_timer();
+        rfinfo!(rf, "timer reset, channels are set");
+        drop(rf);
+
+        let rf = self.rf.clone();
+        // poll from channels' rx
+        self.tp
+            .spawn(async move {
+                loop {
+                    select! {
+                        action = action_rx.select_next_some() => {
+                            rf.lock().unwrap().mux_actions(action);
+                        }
+
+                        reply = reply_rx.select_next_some() => {
+                            rf.lock().unwrap().mux_replies(reply);
+                        }
+                    }
+                }
+            })
+            .unwrap();
+    }
+
+    fn timer(&mut self) {
+        let (timer_tx, mut timer_rx) = futures::channel::mpsc::unbounded();
+
+        let mut rf = self.rf.lock().unwrap();
+        rf.timer_tx = Some(timer_tx);
+        drop(rf);
+
+        let rf = self.rf.clone();
+
+        // two timers, heartbeat timer and timeout timer
+        let mut heartbeat_timer = Node::rebuild_heartbeat_timer();
+        let mut timeout_timer = Node::rebuild_timeout_timer();
+
+        self.tp
+            .spawn(async move {
+                loop {
+                    select! {
+                        _ = timer_rx.select_next_some() => {
+                            timeout_timer = Node::rebuild_timeout_timer();
+                        }
+
+                        _ = heartbeat_timer => {
+                            rf.lock().unwrap().action_tx.as_ref().unwrap().unbounded_send(Actions::SendHeartbeat).unwrap();
+                            heartbeat_timer = Node::rebuild_heartbeat_timer();
+                        }
+
+                        _ = timeout_timer => {
+                            rf.lock().unwrap().action_tx.as_ref().unwrap().unbounded_send(Actions::StartElection).unwrap();
+                            timeout_timer = Node::rebuild_timeout_timer();
+                        }
+                    }
+                }
+            })
+            .unwrap();
+    }
+
+    fn rebuild_heartbeat_timer() -> Fuse<Delay> {
+        Delay::new(Duration::from_millis(HEARTBEAT_INTERVAL)).fuse()
+    }
+
+    fn rebuild_timeout_timer() -> Fuse<Delay> {
+        let timeout = rand::thread_rng().gen_range(TIMEOUT_MIN, TIMEOUT_MIN * 3);
+        Delay::new(Duration::from_millis(timeout)).fuse()
     }
 
     /// the service using Raft (e.g. a k/v server) wants to start
@@ -517,7 +674,8 @@ impl Node {
         // Your code here.
         // Example:
         // self.raft.start(command)
-        crate::your_code_here(command)
+        let rf = self.rf.lock().unwrap();
+        rf.start(command)
     }
 
     /// The current term of this peer.
@@ -596,11 +754,11 @@ impl RaftService for Node {
     async fn request_vote(&self, args: RequestVoteArgs) -> labrpc::Result<RequestVoteReply> {
         // Your code here (2A, 2B).
         let mut rf = self.rf.lock().unwrap();
-        rf.request_vote(args)
+        rf.request_vote_handler(args)
     }
 
     async fn append_entries(&self, args: AppendEntriesArgs) -> labrpc::Result<AppendEntriesReply> {
         let mut rf = self.rf.lock().unwrap();
-        rf.append_entries(args)
+        rf.append_entries_handler(args)
     }
 }
