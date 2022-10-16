@@ -362,6 +362,7 @@ impl Raft {
         let mut reply = AppendEntriesReply {
             term: self.state.term(),
             success: false,
+            conflict_index: 0,
         };
         if args.term < self.state.term() {
             return Ok(reply);
@@ -380,12 +381,32 @@ impl Raft {
             );
         }
 
+        // matches the prefix of logs?
         let matches =
             self.term_at_logical(args.prev_log_index as usize) == Some(args.prev_log_term);
         if !matches {
+            // the prefix is not match, the log has some conflicts...
             reply.success = false;
+
+            // provide conflict index for leader
+            reply.conflict_index = if self.last_log_index_logical() < args.prev_log_index {
+                self.last_log_index_logical() + 1
+            } else {
+                // ATTENTION: find the first log has the term of [the term of conflicted log]
+                // since the logs before prev_log_index are thought to be sync
+                let conflict_term = self.term_at_logical(args.prev_log_index as usize).unwrap();
+                // todo(last_included_index)
+                let mut conflict_index = 0;
+                for index in 1..=args.prev_log_index {
+                    if self.term_at_logical(index as usize).unwrap() == conflict_term {
+                        conflict_index = index;
+                        break;
+                    }
+                }
+                conflict_index
+            };
         } else {
-            // append logs
+            // the prefix matches, start replicating logs
             let mut consistent_with_leader = true;
             for (i, log) in args.log_entries.iter().enumerate() {
                 // prev = 10, new logs: [11, 12, 13, ....]
@@ -394,6 +415,7 @@ impl Raft {
                     consistent_with_leader = false;
                 }
             }
+
             // if consistent with leader, we don't need to do anything on our logs
             // if inconsistence with leader, we force it
             if !consistent_with_leader {
@@ -404,7 +426,9 @@ impl Raft {
                     .into_iter()
                     .for_each(|log| self.log.push(log));
             }
+            reply.success = true;
             self.update_commit_index(args.leader_commit);
+            self.apply();
         }
 
         Ok(reply)
@@ -502,6 +526,19 @@ impl Raft {
         }
     }
 
+    fn data_at_physical(&self, phy_index: usize) -> Vec<u8> {
+        self.log[phy_index].rb.clone()
+    }
+
+    fn data_at_logical(&self, logical_index: usize) -> Option<Vec<u8>> {
+        let phy_index = self.index_logical_to_physical(logical_index);
+        if phy_index >= self.log.len() {
+            None
+        } else {
+            Some(self.data_at_physical(phy_index))
+        }
+    }
+
     /// log: [1, 2, 3] should returns 3
     ///todo: last_included_index: 5, log[6, 7, 8], returns, lli + len(log)
     fn last_log_index_logical(&self) -> u64 {
@@ -516,9 +553,55 @@ impl Raft {
         }
     }
 
+    fn valid_commit_index_from_majority(&self) -> u64 {
+        let mut n = self.commit_index;
+        for i in self.commit_index + 1..self.last_log_index_logical() {
+            // how many peers have >= i?
+            let mut nmatches = 1; // me
+            for j in 0..self.peers.len() {
+                if j != self.me && self.match_index[j] >= i {
+                    nmatches += 1;
+                }
+            }
+            // there exists an N, > commit index, majority of matchIndex >== N
+            // and log[N].term == currentTerm, set commitIndex = N
+            if nmatches > self.peers.len() / 2 {
+                if self.term_at_logical(i as usize) == Some(self.term()) {
+                    n = i;
+                    break;
+                }
+            }
+        }
+        n
+    }
+
+    fn apply(&mut self) {
+        if self.last_applied > self.commit_index {
+            rfwarn!(
+                self,
+                "last_applied {} >= self.commit_index {}???",
+                self.last_applied,
+                self.commit_index
+            );
+        }
+        // (last_applied, commit_index]
+        let interval = self.last_applied + 1..=self.commit_index;
+        for index in interval {
+            let msg = ApplyMsg::Command {
+                data: self.data_at_logical(index as usize).unwrap(),
+                index,
+            };
+            self.apply_tx.unbounded_send(msg).unwrap();
+            self.last_applied += 1;
+        }
+    }
+
     /// advance the commit index to majority's commit index
     /// and if updated, we try to apply that to state machine
-    fn advance_commit_index_and_apply(&mut self) {}
+    fn advance_commit_index_and_apply(&mut self) {
+        self.commit_index = self.valid_commit_index_from_majority();
+        self.apply();
+    }
 }
 
 // actions
@@ -666,6 +749,10 @@ impl Raft {
         if reply.success {
             self.next_index[from as usize] = next_index;
             self.match_index[from as usize] = next_index - 1;
+            self.advance_commit_index_and_apply(); // todo
+        } else {
+            // update the next index based on conflict index
+            self.next_index[from as usize] = reply.conflict_index;
         }
     }
 }
