@@ -252,6 +252,9 @@ impl Raft {
         Ok((self.last_log_index_logical(), self.last_log_term()))
     }
 
+    // called by upper application layer, let the raft instance conditionally
+    // install the snapshot, this should result in calling install_snapshot()
+    // by `self`
     fn cond_install_snapshot(
         &mut self,
         last_included_term: u64,
@@ -262,6 +265,7 @@ impl Raft {
         crate::your_code_here((last_included_term, last_included_index, snapshot));
     }
 
+    // called by upper application layer, let the raft instance snapshot its current state
     fn snapshot(&mut self, index: u64, snapshot: &[u8]) {
         // Your code here (2D).
         crate::your_code_here((index, snapshot));
@@ -442,6 +446,24 @@ impl Raft {
         }
 
         Ok(reply)
+    }
+
+    //todo:
+    // this is what raft does when it receives install_snapshot RPC
+    // it packed the snapshot up to the service(application), and the application
+    // should call self.rf.cond_install_snapshot(), which directs to where we
+    // actually install the snapshot and compact the log
+    fn install_snapshot_handler(
+        &mut self,
+        args: InstallSnapshotArgs,
+    ) -> labrpc::Result<InstallSnapshotReply> {
+        if args.term > self.term() {
+            self.turn_follower(args.term, Some(-1));
+        }
+
+        if self.is_follower() {}
+
+        Ok(InstallSnapshotReply { term: self.term() })
     }
 }
 
@@ -671,6 +693,11 @@ impl Raft {
             log_entries,
         })
     }
+
+    //todo
+    fn compact_log_given_snapshot(&mut self) {
+        unimplemented!()
+    }
 }
 
 // actions
@@ -873,6 +900,11 @@ impl Raft {
         let mut state = vec![];
         labcodec::encode(&nv_state, &mut state).unwrap();
         self.persister.save_raft_state(state);
+    }
+
+    //todo
+    fn persist_with_snapshot(&mut self, snapshot: Vec<u8>) {
+        unimplemented!()
     }
 
     /// restore previously persisted state.
@@ -1143,5 +1175,13 @@ impl RaftService for Node {
     async fn append_entries(&self, args: AppendEntriesArgs) -> labrpc::Result<AppendEntriesReply> {
         let mut rf = self.rf.lock().unwrap();
         rf.append_entries_handler(args)
+    }
+
+    async fn install_snapshot(
+        &self,
+        args: InstallSnapshotArgs,
+    ) -> labrpc::Result<InstallSnapshotReply> {
+        let mut rf = self.rf.lock().unwrap();
+        rf.install_snapshot_handler(args)
     }
 }
