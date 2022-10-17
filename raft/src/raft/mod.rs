@@ -27,6 +27,7 @@ const TIMEOUT_MIN: u64 = 200;
 /// As each Raft peer becomes aware that successive log entries are committed,
 /// the peer should send an `ApplyMsg` to the service (or tester) on the same
 /// server, via the `apply_ch` passed to `Raft::new`.
+#[derive(Debug)]
 pub enum ApplyMsg {
     Command {
         data: Vec<u8>,
@@ -150,6 +151,12 @@ macro_rules! rfinfo {
     };
 }
 
+macro_rules! rfdebug {
+    ($raft:expr, $($args:tt)+) => {
+        debug!("rf [me: {}] [state: {:?}], {}", $raft.me, $raft.state, format_args!($($args)+));
+    };
+}
+
 macro_rules! rfpanic {
     ($raft:expr, $($args:tt)+) => {
         error!("rf [me: {}] [state: {:?}], {}", $raft.me, $raft.state, format_args!($($args)+));
@@ -251,12 +258,12 @@ impl Raft {
         if !self.is_leader() {
             return Err(Error::NotLeader);
         }
-
+        rfinfo!(self, "Start replicating command {:?}", command);
         let entry = LogEntry {
             term: self.term(),
             rb: buf,
         };
-        rfinfo!(
+        rfdebug!(
             self,
             "pushing log {:?} into the log at index {}",
             &entry,
@@ -338,13 +345,13 @@ impl Raft {
         // if I have not vote, or I have vote for the sender, I will vote for sender
         if self.vote_for_nobody() || self.voted_for == args.cid as i64 {
             if self.candidate_up_to_date(&args) {
-                rfinfo!(self, "votes, candidate {} is up to date", args.cid);
+                rfdebug!(self, "votes, candidate {} is up to date", args.cid);
                 // we can vote only to up-to-date candidates
                 self.voted_for = args.cid as i64;
                 reply.granted = true;
                 self.reset_timer();
             }
-            rfinfo!(self, "do not vote, candidate {} w/ stale log", args.cid);
+            rfdebug!(self, "do not vote, candidate {} w/ stale log", args.cid);
         }
 
         reply.term = self.term();
@@ -446,6 +453,9 @@ impl Raft {
                     .into_iter()
                     .for_each(|log| self.log.push(log));
             }
+
+            rfdebug!(self, "Replicated! log: {:?}", self.log);
+
             reply.success = true;
             self.update_commit_index(args.leader_commit);
             self.apply();
@@ -529,7 +539,9 @@ impl Raft {
     }
 
     fn index_logical_to_physical(&self, logical_index: usize) -> Option<usize> {
-        logical_index.checked_sub(self.last_included_index as usize - 1)
+        logical_index
+            .checked_sub(self.last_included_index as usize)
+            .and_then(|a| a.checked_sub(1))
     }
 
     fn log_at_logical(&self, logical_index: usize) -> Option<LogEntry> {
@@ -567,11 +579,24 @@ impl Raft {
         if leader_commit > self.commit_index {
             self.commit_index = std::cmp::min(leader_commit, self.last_log_index_logical())
         }
+        rfinfo!(
+            self,
+            "new commit_index: {}, leader commit: {}, my last log index: {}",
+            self.commit_index,
+            leader_commit,
+            self.last_log_index_logical()
+        );
     }
 
     fn valid_commit_index_from_majority(&self) -> u64 {
         let mut n = self.commit_index;
-        for i in self.commit_index + 1..self.last_log_index_logical() {
+        rfdebug!(
+            self,
+            "try range from {} -> {}",
+            self.commit_index + 1,
+            self.last_log_index_logical()
+        );
+        for i in self.commit_index + 1..=self.last_log_index_logical() {
             // how many peers have >= i?
             let mut nmatches = 1; // me
             for j in 0..self.peers.len() {
@@ -579,11 +604,21 @@ impl Raft {
                     nmatches += 1;
                 }
             }
+
+            rfdebug!(
+                self,
+                "try advance commit index to {}, nmatches={}, term at i: {}",
+                i,
+                nmatches,
+                self.term_at_logical(i as usize).unwrap()
+            );
+
             // there exists an N, > commit index, majority of matchIndex >== N
             // and log[N].term == currentTerm, set commitIndex = N
-            if nmatches > self.peers.len() / 2
-                && self.term_at_logical(i as usize) == Some(self.term())
+            if (nmatches > (self.peers.len() / 2))
+                && (self.term_at_logical(i as usize) == Some(self.term()))
             {
+                rfdebug!(self, "advance commit index to {}", i);
                 n = i;
                 break;
             }
@@ -607,6 +642,7 @@ impl Raft {
                 data: self.data_at_logical(index as usize).unwrap(),
                 index,
             };
+            rfinfo!(self, "applying {:?}", msg);
             self.apply_tx.unbounded_send(msg).unwrap();
             self.last_applied += 1;
         }
@@ -616,6 +652,11 @@ impl Raft {
     /// and if updated, we try to apply that to state machine
     fn advance_commit_index_and_apply(&mut self) {
         self.commit_index = self.valid_commit_index_from_majority();
+        rfinfo!(
+            self,
+            "successfully advance commit index to {}",
+            self.commit_index
+        );
         self.apply();
     }
 
@@ -629,6 +670,7 @@ impl Raft {
                 panic!("i: {}, start: {}, end: {}", i, start_logical, end_logical,)
             }));
         }
+        rfdebug!(self, "AE log entries for {}: {:?}", peer, log_entries);
         let prev_log_index = self.next_index[peer as usize] - 1;
         let prev_log_term = if prev_log_index == self.last_included_index {
             self.last_included_term
@@ -654,7 +696,7 @@ impl Raft {
             return;
         }
 
-        rfinfo!(self, "Sending heartbeat");
+        rfdebug!(self, "Sending heartbeat");
 
         // prev: 10, log:[11, 12], next = 13
         for i in 0..self.peers.len() {
@@ -689,7 +731,7 @@ impl Raft {
         if self.is_leader() {
             return;
         }
-        rfinfo!(self, "starting election");
+        rfdebug!(self, "starting election");
         self.turn_candidate();
 
         let args = RequestVoteArgs {
@@ -743,7 +785,7 @@ impl Raft {
 
     /// this is for election, after we send
     fn handle_request_vote_reply(&mut self, from: u64, reply: RequestVoteReply) {
-        rfinfo!(self, "handling RV reply, reply: {:?}", reply);
+        rfdebug!(self, "handling RV reply, reply: {:?}", reply);
         if reply.term > self.term() {
             self.turn_follower(reply.term, Some(-1));
         }
@@ -785,7 +827,7 @@ impl Raft {
         if reply.success {
             self.next_index[from as usize] = next_index;
             self.match_index[from as usize] = next_index - 1;
-            rfinfo!(
+            rfdebug!(
                 self,
                 "AE reply handler: success, next_index: {:?}, match_index: {:?}",
                 self.next_index,
@@ -794,7 +836,7 @@ impl Raft {
             self.advance_commit_index_and_apply(); // todo
         } else {
             // update the next index based on conflict index
-            rfinfo!(
+            rfdebug!(
                 self,
                 "AE reply handler: failed, next_index: {:?}, match_index: {:?}",
                 self.next_index,

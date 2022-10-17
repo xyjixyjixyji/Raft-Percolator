@@ -387,12 +387,14 @@ fn test_backup_2b() {
     cfg.disconnect((leader1 + 4) % servers);
 
     // submit lots of commands that won't commit
+    info!("TEST: submission start");
     for _i in 0..50 {
         let _ = cfg.rafts.lock().unwrap()[leader1]
             .as_ref()
             .unwrap()
             .start(&random_entry(&mut random));
     }
+    info!("TEST: submission done");
 
     thread::sleep(RAFT_ELECTION_TIMEOUT / 2);
 

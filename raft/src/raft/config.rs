@@ -293,6 +293,7 @@ impl Config {
                     if let Some(ref rf) = &rafts[starts] {
                         match rf.start(&cmd) {
                             Ok((index1, _)) => {
+                                warn!("TESTWARN rf {}, index: {}", starts, index1);
                                 index = Some(index1);
                                 break;
                             }
@@ -308,6 +309,7 @@ impl Config {
                 let t1 = Instant::now();
                 while t1.elapsed() < Duration::from_secs(2) {
                     let (nd, cmd1) = self.n_committed(index);
+                    warn!("TESTWARN nd: {}, cmd1: {:?}", nd, cmd1);
                     if nd > 0 && nd >= expected_servers {
                         // committed
                         if let Some(cmd2) = cmd1 {
