@@ -629,7 +629,7 @@ impl Raft {
         self.apply();
     }
 
-    fn append_entries_args_for(&self, peer: u64) -> AppendEntriesArgs {
+    fn append_entries_args_for(&self, peer: u64) -> Option<AppendEntriesArgs> {
         let mut log_entries = vec![];
         let start_logical = self.next_index[peer as usize];
         let end_logical = self.last_log_index_logical();
@@ -645,21 +645,33 @@ impl Raft {
                 );
             }));
         }
-        rfdebug!(self, "AE log entries for {}: {:?}", peer, log_entries);
+        rfdebug!(
+            self,
+            "AE log entries for {}: length: {}",
+            peer,
+            log_entries.len()
+        );
         let prev_log_index = self.next_index[peer as usize] - 1;
         let prev_log_term = if prev_log_index == self.last_included_index {
             self.last_included_term
         } else {
-            self.term_at_logical(prev_log_index as usize).unwrap()
+            // (Situation 1):
+            // I thought myself is a leader and replicated many logs to another machine within the partition
+            // therefore next_index[peer] is very high, but I was not a partition again, so my log was cleared
+            // but the another machine was still in partition. When I am leader again, the next_index is
+            // not feasible, maybe too large since my log was cleared.
+            //
+            // under the situation above, we should just send install_snapshot RPC, and backward my next_index for that machine
+            self.term_at_logical(prev_log_index as usize)?
         };
-        AppendEntriesArgs {
+        Some(AppendEntriesArgs {
             term: self.term(),
             leader_id: self.me as u64,
             leader_commit: self.commit_index,
             prev_log_term,
             prev_log_index,
             log_entries,
-        }
+        })
     }
 }
 
@@ -679,26 +691,33 @@ impl Raft {
                 continue;
             }
 
-            let args = self.append_entries_args_for(i as u64);
-            let next_index_on_success = args.prev_log_index + (args.log_entries.len()) as u64 + 1;
+            if let Some(args) = self.append_entries_args_for(i as u64) {
+                let next_index_on_success =
+                    args.prev_log_index + (args.log_entries.len()) as u64 + 1;
 
-            let fut = self.peers[i].append_entries(&args);
-            let reply_tx = self.reply_tx.as_ref().unwrap().clone();
+                let fut = self.peers[i].append_entries(&args);
+                let reply_tx = self.reply_tx.as_ref().unwrap().clone();
 
-            self.tp
-                .spawn(async move {
-                    if let Ok(reply) = fut.await {
-                        reply_tx
-                            .unbounded_send(RepliesFrom::AppendEntriesReplyFrom(
-                                i as u64,
-                                next_index_on_success,
-                                reply,
-                            ))
-                            .unwrap()
-                    }
-                    // we also need to send the next_index for leader to update
-                })
-                .unwrap();
+                self.tp
+                    .spawn(async move {
+                        if let Ok(reply) = fut.await {
+                            reply_tx
+                                .unbounded_send(RepliesFrom::AppendEntriesReplyFrom(
+                                    i as u64,
+                                    next_index_on_success,
+                                    reply,
+                                ))
+                                .unwrap()
+                        }
+                        // we also need to send the next_index for leader to update
+                    })
+                    .unwrap();
+            } else {
+                // the next_index for peer i is stale, maybe all the logs are not available for this peer....
+                // very bad case.... snapshot can make this milder but still so bad
+                //todo: install_snapshot
+                self.next_index[i] = self.last_included_index + 1;
+            }
         }
     }
 
