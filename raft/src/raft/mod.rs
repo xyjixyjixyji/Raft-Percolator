@@ -131,7 +131,6 @@ pub struct Raft {
     last_included_index: u64,
     last_included_term: u64,
 
-    //todo: send applyMsg to upper layer application, rx is in kvstore
     #[allow(dead_code)]
     apply_tx: UnboundedSender<ApplyMsg>,
     // send regular actions, rx is in loop, tx in send_actions
@@ -399,7 +398,6 @@ impl Raft {
                 // ATTENTION: find the first log has the term of [the term of conflicted log]
                 // since the logs before prev_log_index are thought to be sync
                 let conflict_term = self.term_at_logical(args.prev_log_index as usize).unwrap();
-                // todo(last_included_index)
                 let mut conflict_index = 0;
                 for index in self.last_included_index + 1..=args.prev_log_index {
                     if self.term_at_logical(index as usize).unwrap() == conflict_term {
@@ -808,7 +806,7 @@ impl Raft {
         if reply.term > self.term() {
             self.turn_follower(reply.term, Some(-1));
         }
-        //todo: handle log
+
         if !self.is_leader() {
             rfwarn!(
                 self,
@@ -829,7 +827,7 @@ impl Raft {
                 self.next_index,
                 self.match_index
             );
-            self.advance_commit_index_and_apply(); // todo
+            self.advance_commit_index_and_apply();
         } else {
             // update the next index based on conflict index
             if reply.conflict_index == 0 {
