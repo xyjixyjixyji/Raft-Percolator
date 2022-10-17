@@ -164,6 +164,14 @@ macro_rules! rfpanic {
     };
 }
 
+macro_rules! rfpanic_on {
+    ($cond: expr, $raft: expr, $($args:tt)+) => {
+        if $cond {
+            rfpanic!($raft, $($args)+);
+        }
+    }
+}
+
 macro_rules! rfwarn {
     ($raft:expr, $($args:tt)+) => {
         warn!("rf [me: {}] [state: {:?}], {}", $raft.me, $raft.state, format_args!($($args)+));
@@ -218,35 +226,6 @@ impl Raft {
         rf
     }
 
-    /// save Raft's persistent state to stable storage,
-    /// where it can later be retrieved after a crash and restart.
-    /// see paper's Figure 2 for a description of what should be persistent.
-    fn persist(&mut self) {
-        // Your code here (2C).
-        // Example:
-        // labcodec::encode(&self.xxx, &mut data).unwrap();
-        // labcodec::encode(&self.yyy, &mut data).unwrap();
-        // self.persister.save_raft_state(data);
-    }
-
-    /// restore previously persisted state.
-    fn restore(&mut self, data: &[u8]) {
-        if data.is_empty() {
-            // bootstrap without any state?
-        }
-        // Your code here (2C).
-        // Example:
-        // match labcodec::decode(data) {
-        //     Ok(o) => {
-        //         self.xxx = o.xxx;
-        //         self.yyy = o.yyy;
-        //     }
-        //     Err(e) => {
-        //         panic!("{:?}", e);
-        //     }
-        // }
-    }
-
     fn start<M>(&mut self, command: &M) -> Result<(u64, u64)>
     where
         M: labcodec::Message,
@@ -270,6 +249,7 @@ impl Raft {
         );
         self.log.push(entry);
         self.reset_timer();
+        self.persist();
         Ok((self.last_log_index_logical(), self.last_log_term()))
     }
 
@@ -341,14 +321,16 @@ impl Raft {
             self.turn_follower(args.term, Some(-1));
         }
 
-        // if I have not vote, or I have vote for the sender, I will vote for sender
-        if self.vote_for_nobody() || self.voted_for == args.cid as i64 {
-            if self.candidate_up_to_date(&args) {
-                // we can vote only to up-to-date candidates
-                self.voted_for = args.cid as i64;
-                reply.granted = true;
-                self.reset_timer();
-            }
+        // if I have not vote, or I have vote for the sender, I will try vote for candidate
+        // but only if the candidate is up-to-date, will I vote him
+        if (self.vote_for_nobody() || self.voted_for == args.cid as i64)
+            && self.candidate_up_to_date(&args)
+        {
+            // we can vote only to up-to-date candidates
+            self.voted_for = args.cid as i64;
+            reply.granted = true;
+            self.reset_timer();
+            self.persist();
         }
 
         reply.term = self.term();
@@ -451,6 +433,9 @@ impl Raft {
                     .for_each(|log| self.log.push(log));
             }
 
+            // if !match, state is untouched
+            self.persist();
+
             rfdebug!(self, "Replicated! log: {:?}", self.log);
 
             reply.success = true;
@@ -479,6 +464,7 @@ impl Raft {
         if let Some(v) = voted_for {
             self.voted_for = v;
         }
+        self.persist();
     }
 
     fn turn_candidate(&mut self) {
@@ -486,6 +472,7 @@ impl Raft {
         self.state.term += 1;
         self.voters = vec![self.me as u64];
         self.voted_for = self.me as i64;
+        self.persist();
     }
 
     fn turn_leader(&mut self) {
@@ -831,6 +818,55 @@ impl Raft {
                 self.match_index
             );
             self.next_index[from as usize] = reply.conflict_index;
+        }
+    }
+}
+
+// persist apis
+impl Raft {
+    fn pack_nvstate(&self) -> RaftNonVolatileState {
+        rfpanic_on!(
+            self.voted_for == -1,
+            self,
+            "voted_for should never be -1 when persist"
+        );
+        RaftNonVolatileState {
+            current_term: self.term(),
+            voted_for: self.voted_for as u64,
+            log: self.log.clone(),
+            last_included_index: self.last_included_index,
+            last_included_term: self.last_included_term,
+        }
+    }
+
+    /// save Raft's persistent state to stable storage,
+    /// where it can later be retrieved after a crash and restart.
+    /// see paper's Figure 2 for a description of what should be persistent.
+    fn persist(&mut self) {
+        let nv_state = self.pack_nvstate();
+        let mut state = vec![];
+        labcodec::encode(&nv_state, &mut state).unwrap();
+        self.persister.save_raft_state(state);
+    }
+
+    /// restore previously persisted state.
+    fn restore(&mut self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        match labcodec::decode(data) {
+            Ok(nv_state) => {
+                let nv_state: RaftNonVolatileState = nv_state;
+                self.state.term = nv_state.current_term;
+                self.voted_for = nv_state.voted_for as i64;
+                self.log = nv_state.log;
+                self.last_included_index = nv_state.last_included_index;
+                self.last_included_term = nv_state.last_included_term;
+            }
+
+            Err(e) => {
+                rfpanic!(self, "error decoding non-volatile data, err: {:?}", e);
+            }
         }
     }
 }

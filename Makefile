@@ -2,7 +2,7 @@ export RUSTFLAGS=-Dwarnings
 export RUST_TEST_THREADS=1
 export RUST_BACKTRACE=1
 
-LEVEL_RF=debug
+LEVEL_RF=info
 LOG_LEVEL ?= raft=${LEVEL_RF},percolator=info
 
 check:
