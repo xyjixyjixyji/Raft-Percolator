@@ -215,7 +215,6 @@ impl Raft {
         // initialize from state persisted before a crash
         rf.restore(&raft_state);
 
-        rfinfo!(rf, "raft::new() called");
         rf
     }
 
@@ -345,13 +344,11 @@ impl Raft {
         // if I have not vote, or I have vote for the sender, I will vote for sender
         if self.vote_for_nobody() || self.voted_for == args.cid as i64 {
             if self.candidate_up_to_date(&args) {
-                rfdebug!(self, "votes, candidate {} is up to date", args.cid);
                 // we can vote only to up-to-date candidates
                 self.voted_for = args.cid as i64;
                 reply.granted = true;
                 self.reset_timer();
             }
-            rfdebug!(self, "do not vote, candidate {} w/ stale log", args.cid);
         }
 
         reply.term = self.term();
@@ -579,23 +576,17 @@ impl Raft {
         if leader_commit > self.commit_index {
             self.commit_index = std::cmp::min(leader_commit, self.last_log_index_logical())
         }
-        rfinfo!(
-            self,
-            "new commit_index: {}, leader commit: {}, my last log index: {}",
-            self.commit_index,
-            leader_commit,
-            self.last_log_index_logical()
-        );
+        // rfinfo!(
+        //     self,
+        //     "new commit_index: {}, leader commit: {}, my last log index: {}",
+        //     self.commit_index,
+        //     leader_commit,
+        //     self.last_log_index_logical()
+        // );
     }
 
     fn valid_commit_index_from_majority(&self) -> u64 {
         let mut n = self.commit_index;
-        rfdebug!(
-            self,
-            "try range from {} -> {}",
-            self.commit_index + 1,
-            self.last_log_index_logical()
-        );
         for i in self.commit_index + 1..=self.last_log_index_logical() {
             // how many peers have >= i?
             let mut nmatches = 1; // me
@@ -605,20 +596,11 @@ impl Raft {
                 }
             }
 
-            rfdebug!(
-                self,
-                "try advance commit index to {}, nmatches={}, term at i: {}",
-                i,
-                nmatches,
-                self.term_at_logical(i as usize).unwrap()
-            );
-
             // there exists an N, > commit index, majority of matchIndex >== N
             // and log[N].term == currentTerm, set commitIndex = N
             if (nmatches > (self.peers.len() / 2))
                 && (self.term_at_logical(i as usize) == Some(self.term()))
             {
-                rfdebug!(self, "advance commit index to {}", i);
                 n = i;
                 break;
             }
@@ -666,8 +648,14 @@ impl Raft {
         let end_logical = self.last_log_index_logical();
         for i in start_logical..=end_logical {
             log_entries.push(self.log_at_logical(i as usize).unwrap_or_else(|| {
-                rfwarn!(self, "next_index: {:?}", self.next_index);
-                panic!("i: {}, start: {}, end: {}", i, start_logical, end_logical,)
+                rfpanic!(
+                    self,
+                    "next_index: {:?}, i: {}, start: {}, end: {}",
+                    self.next_index,
+                    i,
+                    start_logical,
+                    end_logical
+                );
             }));
         }
         rfdebug!(self, "AE log entries for {}: {:?}", peer, log_entries);
@@ -912,7 +900,6 @@ impl Node {
         rf.action_tx = Some(action_tx);
         rf.reply_tx = Some(reply_tx);
         rf.reset_timer();
-        rfinfo!(rf, "timer reset, channels are set");
         drop(rf);
 
         let rf = self.rf.clone();
