@@ -164,13 +164,13 @@ macro_rules! rfpanic {
     };
 }
 
-macro_rules! rfpanic_on {
-    ($cond: expr, $raft: expr, $($args:tt)+) => {
-        if $cond {
-            rfpanic!($raft, $($args)+);
-        }
-    }
-}
+// macro_rules! rfpanic_on {
+//     ($cond: expr, $raft: expr, $($args:tt)+) => {
+//         if $cond {
+//             rfpanic!($raft, $($args)+);
+//         }
+//     }
+// }
 
 macro_rules! rfwarn {
     ($raft:expr, $($args:tt)+) => {
@@ -800,24 +800,33 @@ impl Raft {
         }
         // if success, means that the log sent is replicated on `from`
         if reply.success {
+            // change(next_index): place 1
             self.next_index[from as usize] = next_index;
             self.match_index[from as usize] = next_index - 1;
             rfdebug!(
                 self,
-                "AE reply handler: success, next_index: {:?}, match_index: {:?}",
+                "AE reply[from: {}] handler: success, next_index: {:?}, match_index: {:?}",
+                from,
                 self.next_index,
                 self.match_index
             );
             self.advance_commit_index_and_apply(); // todo
         } else {
             // update the next index based on conflict index
+            if reply.conflict_index == 0 {
+                // invalid index, quit fast backup
+                self.next_index[from as usize] =
+                    self.next_index[from as usize].saturating_sub(1).max(1);
+            } else {
+                self.next_index[from as usize] = reply.conflict_index;
+            }
             rfdebug!(
                 self,
-                "AE reply handler: failed, next_index: {:?}, match_index: {:?}",
+                "AE reply[from: {}] handler: failed, next_index: {:?}, match_index: {:?}",
+                from,
                 self.next_index,
                 self.match_index
             );
-            self.next_index[from as usize] = reply.conflict_index;
         }
     }
 }
@@ -825,14 +834,14 @@ impl Raft {
 // persist apis
 impl Raft {
     fn pack_nvstate(&self) -> RaftNonVolatileState {
-        rfpanic_on!(
-            self.voted_for == -1,
-            self,
-            "voted_for should never be -1 when persist"
-        );
+        // rfpanic_on!(
+        //     self.voted_for == -1,
+        //     self,
+        //     "voted_for should never be -1 when persist"
+        // );
         RaftNonVolatileState {
             current_term: self.term(),
-            voted_for: self.voted_for as u64,
+            voted_for: self.voted_for,
             log: self.log.clone(),
             last_included_index: self.last_included_index,
             last_included_term: self.last_included_term,
