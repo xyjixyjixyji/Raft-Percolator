@@ -436,7 +436,7 @@ impl Raft {
             // if !match, state is untouched
             self.persist();
 
-            rfdebug!(self, "Replicated! log: {:?}", self.log);
+            rfinfo!(self, "Replicated! log: {:?}", self.log);
 
             reply.success = true;
             self.update_commit_index(args.leader_commit);
@@ -611,7 +611,7 @@ impl Raft {
                 data: self.data_at_logical(index as usize).unwrap(),
                 index,
             };
-            rfinfo!(self, "applying {:?}", msg);
+            rfdebug!(self, "applying {:?}", msg);
             self.apply_tx.unbounded_send(msg).unwrap();
             self.last_applied += 1;
         }
@@ -621,7 +621,7 @@ impl Raft {
     /// and if updated, we try to apply that to state machine
     fn advance_commit_index_and_apply(&mut self) {
         self.commit_index = self.valid_commit_index_from_majority();
-        rfinfo!(
+        rfdebug!(
             self,
             "successfully advance commit index to {}",
             self.commit_index
@@ -671,7 +671,7 @@ impl Raft {
             return;
         }
 
-        rfdebug!(self, "Sending heartbeat");
+        rfinfo!(self, "Sending heartbeat");
 
         // prev: 10, log:[11, 12], next = 13
         for i in 0..self.peers.len() {
@@ -706,7 +706,7 @@ impl Raft {
         if self.is_leader() {
             return;
         }
-        rfdebug!(self, "starting election");
+        rfinfo!(self, "starting election");
         self.turn_candidate();
 
         let args = RequestVoteArgs {
@@ -760,7 +760,7 @@ impl Raft {
 
     /// this is for election, after we send
     fn handle_request_vote_reply(&mut self, from: u64, reply: RequestVoteReply) {
-        rfdebug!(self, "handling RV reply, reply: {:?}", reply);
+        rfinfo!(self, "handling RV reply, reply: {:?}", reply);
         if reply.term > self.term() {
             self.turn_follower(reply.term, Some(-1));
         }
