@@ -1,0 +1,25 @@
+Snapshot is an intermediate betwwen service and raft instance.
+The snapshot is packed by service! Remember this.
+
+We follow these apis:
+    0. raft.handle_snapshot()
+        a. trim log
+        b. persist snapshot
+        c. update index and term
+
+    1. cond_install_snapshot()
+        a. triggered by service
+        b. judge whether we should install snapshot
+        c. if so, call raft.handle_snapshot()
+
+    2. snapshot()
+        a. call raft.handle_snapshot()
+
+    3. install_snapshot_handler()
+        a. triggered by leader call peer.install_snapshot()
+        b. handle the install_snapshot_args
+
+    4. install_snapshot_request_handler()
+        a. when call peer.install_snapshot(), peer returns a reply
+           we pass this reply to reply_tx
+        b. handle the install_snapshot_reply
