@@ -425,6 +425,7 @@ impl Config {
                 if index > 1 && log.get(&(index - 1)).is_none() {
                     panic!("server {} apply out of order {}", i, index);
                 }
+                warn!("TESTTESTTEST Inserting index {} to peer {} log", index, i);
                 log.insert(index, entry);
                 if index > s.max_index {
                     s.max_index = index;
@@ -449,6 +450,10 @@ impl Config {
                     log.clear();
                     let entry = labcodec::decode(&data).unwrap();
                     log.insert(index, entry);
+                    warn!(
+                        "TESTTESTTEST log CLEARED, Inserting index {} to peer {} log",
+                        index, i
+                    );
                 }
                 future::ready(())
             }

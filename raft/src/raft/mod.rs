@@ -94,8 +94,9 @@ enum Actions {
 }
 
 enum RepliesFrom {
-    RequestVoteReplyFrom(u64, RequestVoteReply),
-    AppendEntriesReplyFrom(u64, u64, AppendEntriesReply),
+    RequestVote(u64, RequestVoteReply),
+    AppendEntries(u64, u64, AppendEntriesReply),
+    InstallSnapshot(u64, u64, InstallSnapshotReply),
 }
 
 struct ResetTimer;
@@ -262,13 +263,37 @@ impl Raft {
         snapshot: &[u8],
     ) -> bool {
         // Your code here (2D).
-        crate::your_code_here((last_included_term, last_included_index, snapshot));
+        if last_included_index >= self.last_included_index
+            && last_included_term >= self.last_included_term
+        {
+            rfdebug!(
+                self,
+                "cond_instal_snapshot last_included_index: {} last_included_term: {}",
+                last_included_index,
+                last_included_term
+            );
+            self.snapshot(last_included_index, last_included_term, snapshot)
+        } else {
+            false
+        }
     }
 
     // called by upper application layer, let the raft instance snapshot its current state
-    fn snapshot(&mut self, index: u64, snapshot: &[u8]) {
+    // the snapshot includes all info up to and including index
+    // 1. trim log
+    // 2. update index
+    // 3. persist
+    fn snapshot(&mut self, index: u64, term: u64, snapshot: &[u8]) -> bool {
         // Your code here (2D).
-        crate::your_code_here((index, snapshot));
+        if self.trim_log_to_logical_included(index, term).is_ok() {
+            self.persist_with_snapshot(snapshot);
+            if index >= self.commit_index {
+                self.commit_index = index;
+                self.last_applied = index;
+            }
+            return true;
+        }
+        false
     }
 }
 
@@ -448,7 +473,6 @@ impl Raft {
         Ok(reply)
     }
 
-    //todo:
     // this is what raft does when it receives install_snapshot RPC
     // it packed the snapshot up to the service(application), and the application
     // should call self.rf.cond_install_snapshot(), which directs to where we
@@ -457,11 +481,28 @@ impl Raft {
         &mut self,
         args: InstallSnapshotArgs,
     ) -> labrpc::Result<InstallSnapshotReply> {
+        if args.term < self.term() {
+            return Ok(InstallSnapshotReply { term: self.term() });
+        }
         if args.term > self.term() {
             self.turn_follower(args.term, Some(-1));
         }
-
-        if self.is_follower() {}
+        if self.is_follower() {
+            let msg = ApplyMsg::Snapshot {
+                data: args.rb,
+                term: args.last_included_term,
+                index: args.last_included_index,
+            };
+            rfinfo!(
+                self,
+                "sending snapshot to service, term {}, index {}, from leader {}",
+                args.last_included_term,
+                args.last_included_index,
+                args.leader_id,
+            );
+            self.reset_timer();
+            self.apply_tx.unbounded_send(msg).unwrap();
+        }
 
         Ok(InstallSnapshotReply { term: self.term() })
     }
@@ -631,7 +672,7 @@ impl Raft {
                 data: self.data_at_logical(index as usize).unwrap(),
                 index,
             };
-            rfdebug!(self, "applying {:?}", msg);
+            rfdebug!(self, "applying Index {}", index);
             self.apply_tx.unbounded_send(msg).unwrap();
             self.last_applied += 1;
         }
@@ -654,16 +695,18 @@ impl Raft {
         let start_logical = self.next_index[peer as usize];
         let end_logical = self.last_log_index_logical();
         for i in start_logical..=end_logical {
-            log_entries.push(self.log_at_logical(i as usize).unwrap_or_else(|| {
-                rfpanic!(
-                    self,
-                    "next_index: {:?}, i: {}, start: {}, end: {}",
-                    self.next_index,
-                    i,
-                    start_logical,
-                    end_logical
-                );
-            }));
+            log_entries.push(self.log_at_logical(i as usize)?);
+            // .unwrap_or_else(|| {
+            //     rfpanic!(
+            //         self,
+            //         "for peer {} next_index: {:?}, i: {}, start: {}, end: {}",
+            //         peer,
+            //         self.next_index,
+            //         i,
+            //         start_logical,
+            //         end_logical
+            //     );
+            // }));
         }
         rfdebug!(
             self,
@@ -694,9 +737,40 @@ impl Raft {
         })
     }
 
-    //todo
-    fn compact_log_given_snapshot(&mut self) {
-        unimplemented!()
+    fn install_snapshot_args(&self) -> InstallSnapshotArgs {
+        InstallSnapshotArgs {
+            term: self.term(),
+            leader_id: self.me as u64,
+            last_included_index: self.last_included_index,
+            last_included_term: self.last_included_term,
+            rb: self.persister.snapshot(),
+        }
+    }
+
+    fn trim_log_to_logical_included(&mut self, logical_index: u64, term: u64) -> Result<()> {
+        rfinfo!(
+            self,
+            "trim log to index {}, my last log index is {}",
+            logical_index,
+            self.last_log_index_logical()
+        );
+
+        if logical_index <= self.last_included_index {
+            Err(Error::PlaceHolder)
+        } else if logical_index > self.last_log_index_logical() {
+            self.last_included_index = logical_index;
+            self.last_included_term = term;
+            self.log.drain(0..self.log.len());
+            Ok(())
+        } else {
+            let phy_index = self
+                .index_logical_to_physical(logical_index as usize)
+                .unwrap();
+            self.last_included_index = logical_index;
+            self.last_included_term = term;
+            self.log.drain(0..=phy_index);
+            Ok(())
+        }
     }
 }
 
@@ -727,7 +801,7 @@ impl Raft {
                     .spawn(async move {
                         if let Ok(reply) = fut.await {
                             reply_tx
-                                .unbounded_send(RepliesFrom::AppendEntriesReplyFrom(
+                                .unbounded_send(RepliesFrom::AppendEntries(
                                     i as u64,
                                     next_index_on_success,
                                     reply,
@@ -740,8 +814,31 @@ impl Raft {
             } else {
                 // the next_index for peer i is stale, maybe all the logs are not available for this peer....
                 // very bad case.... snapshot can make this milder but still so bad
-                //todo: install_snapshot
-                self.next_index[i] = self.last_included_index + 1;
+                // let peer call install_snapshot to install my snapshot
+                let args = self.install_snapshot_args();
+                let next_index_on_success = args.last_included_index + 1;
+                rfdebug!(
+                    self,
+                    "sending install snapshot to peer {}, next_index: {:?}",
+                    i,
+                    self.next_index
+                );
+                let fut = self.peers[i].install_snapshot(&args);
+                let reply_tx = self.reply_tx.as_ref().unwrap().clone();
+
+                self.tp
+                    .spawn(async move {
+                        if let Ok(reply) = fut.await {
+                            reply_tx
+                                .unbounded_send(RepliesFrom::InstallSnapshot(
+                                    i as u64,
+                                    next_index_on_success,
+                                    reply,
+                                ))
+                                .unwrap()
+                        }
+                    })
+                    .unwrap();
             }
         }
     }
@@ -773,7 +870,7 @@ impl Raft {
                 .spawn(async move {
                     if let Ok(reply) = fut.await {
                         reply_tx
-                            .unbounded_send(RepliesFrom::RequestVoteReplyFrom(i as u64, reply))
+                            .unbounded_send(RepliesFrom::RequestVote(i as u64, reply))
                             .unwrap();
                     }
                 })
@@ -793,11 +890,12 @@ impl Raft {
 
     fn mux_replies(&mut self, reply_from: RepliesFrom) {
         match reply_from {
-            RepliesFrom::RequestVoteReplyFrom(peer, reply) => {
-                self.handle_request_vote_reply(peer, reply)
-            }
-            RepliesFrom::AppendEntriesReplyFrom(peer, next, reply) => {
+            RepliesFrom::RequestVote(peer, reply) => self.handle_request_vote_reply(peer, reply),
+            RepliesFrom::AppendEntries(peer, next, reply) => {
                 self.handle_append_entries_reply(peer, next, reply)
+            }
+            RepliesFrom::InstallSnapshot(peer, next, reply) => {
+                self.handle_install_snapshot_reply(peer, next, reply)
             }
         }
     }
@@ -824,6 +922,7 @@ impl Raft {
             }
         }
     }
+
     fn handle_append_entries_reply(
         &mut self,
         from: u64,
@@ -873,6 +972,22 @@ impl Raft {
             );
         }
     }
+
+    fn handle_install_snapshot_reply(
+        &mut self,
+        from: u64,
+        next_index: u64,
+        reply: InstallSnapshotReply,
+    ) {
+        if reply.term > self.term() {
+            self.turn_follower(reply.term, Some(-1));
+        }
+        if self.is_leader() {
+            self.next_index[from as usize] = next_index;
+        } else {
+            rfwarn!(self, "recv install snapshot reply when I am not a leader");
+        }
+    }
 }
 
 // persist apis
@@ -902,9 +1017,12 @@ impl Raft {
         self.persister.save_raft_state(state);
     }
 
-    //todo
-    fn persist_with_snapshot(&mut self, snapshot: Vec<u8>) {
-        unimplemented!()
+    fn persist_with_snapshot(&mut self, snapshot: &[u8]) {
+        let nv_state = self.pack_nvstate();
+        let mut state = vec![];
+        labcodec::encode(&nv_state, &mut state).unwrap();
+        self.persister
+            .save_state_and_snapshot(state, snapshot.to_vec());
     }
 
     /// restore previously persisted state.
@@ -935,7 +1053,7 @@ impl Raft {
     pub fn __suppress_deadcode(&mut self) {
         let _ = self.start(&0);
         let _ = self.cond_install_snapshot(0, 0, &[]);
-        self.snapshot(0, &[]);
+        self.snapshot(0, 0, &[]);
         // let _ = self.send_request_vote(0, Default::default());
         self.persist();
         let _ = &self.state;
@@ -1143,10 +1261,8 @@ impl Node {
         last_included_index: u64,
         snapshot: &[u8],
     ) -> bool {
-        // Your code here.
-        // Example:
-        // self.raft.cond_install_snapshot(last_included_term, last_included_index, snapshot)
-        crate::your_code_here((last_included_term, last_included_index, snapshot));
+        let mut rf = self.rf.lock().unwrap();
+        rf.cond_install_snapshot(last_included_term, last_included_index, snapshot)
     }
 
     /// The service says it has created a snapshot that has all info up to and
@@ -1154,10 +1270,10 @@ impl Node {
     /// (and including) that index. Raft should now trim its log as much as
     /// possible.
     pub fn snapshot(&self, index: u64, snapshot: &[u8]) {
-        // Your code here.
-        // Example:
-        // self.raft.snapshot(index, snapshot)
-        crate::your_code_here((index, snapshot));
+        let mut rf = self.rf.lock().unwrap();
+        rfinfo!(rf, "snapshot() is called by service, index {}", index);
+        let term = rf.term_at_logical(index as usize).unwrap();
+        rf.snapshot(index, term, snapshot)
     }
 }
 
