@@ -413,20 +413,26 @@ impl Raft {
         }
 
         // matches the prefix of logs?
-        let matches =
-            self.term_at_logical(args.prev_log_index as usize) == Some(args.prev_log_term);
+        let term_at_prev_log_index = self.term_at_logical(args.prev_log_index as usize);
+        let matches = term_at_prev_log_index == Some(args.prev_log_term);
 
         if !matches {
             // the prefix is not match, the log has some conflicts...
+            self.report_debug();
+            rfdebug!(
+                self,
+                "args.prev_log_index={}, from: {}",
+                args.prev_log_index,
+                args.leader_id
+            );
             reply.success = false;
 
             // provide conflict index for leader
             reply.conflict_index = if self.last_log_index_logical() < args.prev_log_index {
                 self.last_log_index_logical() + 1
-            } else if args.prev_log_index > 0 {
+            } else if let Some(conflict_term) = term_at_prev_log_index {
                 // ATTENTION: find the first log has the term of [the term of conflicted log]
                 // since the logs before prev_log_index are thought to be sync
-                let conflict_term = self.term_at_logical(args.prev_log_index as usize).unwrap();
                 let mut conflict_index = 0;
                 for index in self.last_included_index + 1..=args.prev_log_index {
                     if self.term_at_logical(index as usize).unwrap() == conflict_term {
@@ -510,6 +516,16 @@ impl Raft {
 
 // utils
 impl Raft {
+    fn report_debug(&self) {
+        rfdebug!(
+            self,
+            "REPORTING nextindex: {:?}, lastincludedindex: {}, log length: {}, last log index {}",
+            self.next_index,
+            self.last_included_index,
+            self.log.len(),
+            self.last_log_index_logical(),
+        );
+    }
     fn reset_timer(&mut self) {
         self.timer_tx
             .as_ref()
@@ -691,6 +707,7 @@ impl Raft {
     }
 
     fn append_entries_args_for(&self, peer: u64) -> Option<AppendEntriesArgs> {
+        self.report_debug();
         let mut log_entries = vec![];
         let start_logical = self.next_index[peer as usize];
         let end_logical = self.last_log_index_logical();
@@ -979,6 +996,13 @@ impl Raft {
         next_index: u64,
         reply: InstallSnapshotReply,
     ) {
+        self.report_debug();
+        rfdebug!(
+            self,
+            "handling install snapshot reply from peer {}, new next_index={}",
+            from,
+            next_index
+        );
         if reply.term > self.term() {
             self.turn_follower(reply.term, Some(-1));
         }
@@ -1273,7 +1297,7 @@ impl Node {
         let mut rf = self.rf.lock().unwrap();
         rfinfo!(rf, "snapshot() is called by service, index {}", index);
         let term = rf.term_at_logical(index as usize).unwrap();
-        rf.snapshot(index, term, snapshot)
+        rf.snapshot(index, term, snapshot);
     }
 }
 
