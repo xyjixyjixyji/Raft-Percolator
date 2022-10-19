@@ -263,6 +263,7 @@ impl Raft {
         snapshot: &[u8],
     ) -> bool {
         // Your code here (2D).
+        //bugbugbug
         if last_included_index >= self.last_included_index
             && last_included_term >= self.last_included_term
         {
