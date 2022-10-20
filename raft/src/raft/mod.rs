@@ -236,17 +236,16 @@ impl Raft {
         if !self.is_leader() {
             return Err(Error::NotLeader);
         }
-        rfinfo!(self, "Start replicating command {:?}", command);
+        rfinfo!(
+            self,
+            "Start replicating index: {}, command {:?}",
+            self.last_log_index_logical() + 1,
+            command
+        );
         let entry = LogEntry {
             term: self.term(),
             rb: buf,
         };
-        rfdebug!(
-            self,
-            "pushing log {:?} into the log at index {}",
-            &entry,
-            self.last_log_index_logical() + 1, // fuck checker
-        );
         self.log.push(entry);
         self.reset_timer();
         self.persist();
@@ -264,12 +263,13 @@ impl Raft {
     ) -> bool {
         // Your code here (2D).
         //bugbugbug
-        if last_included_index >= self.last_included_index
-            && last_included_term >= self.last_included_term
+        if (last_included_term > self.last_included_term)
+            || ((last_included_term == self.last_included_term)
+                && (last_included_index >= self.last_included_index))
         {
             rfdebug!(
                 self,
-                "cond_instal_snapshot last_included_index: {} last_included_term: {}",
+                "cond_install_snapshot last_included_index: {} last_included_term: {}",
                 last_included_index,
                 last_included_term
             );
@@ -470,7 +470,11 @@ impl Raft {
             // if !match, state is untouched
             self.persist();
 
-            rfinfo!(self, "Replicated! log: {:?}", self.log);
+            rfinfo!(
+                self,
+                "Handled Append Entries! my last log index={}",
+                self.last_log_index_logical()
+            );
 
             reply.success = true;
             self.update_commit_index(args.leader_commit);
@@ -488,7 +492,14 @@ impl Raft {
         &mut self,
         args: InstallSnapshotArgs,
     ) -> labrpc::Result<InstallSnapshotReply> {
+        rfdebug!(
+            self,
+            "handling install snapshot request, last included index: {}, last included term: {}",
+            args.last_included_index,
+            args.last_included_term,
+        );
         if args.term < self.term() {
+            rfdebug!(self, "refuse to install since the leader is stale in term");
             return Ok(InstallSnapshotReply { term: self.term() });
         }
         if args.term > self.term() {
@@ -584,14 +595,14 @@ impl Raft {
     /// returns whether the candidate's log is up to date
     fn candidate_up_to_date(&self, args: &RequestVoteArgs) -> bool {
         let my_last_log_term = match self.log.last() {
-            None => 0,
+            None => self.last_included_term,
             Some(e) => e.term,
         };
 
-        // (term, log.len()) decides the precedence
+        // (term, last log index) decides the precedence
         let cond1 = args.last_log_term > my_last_log_term;
         let cond2 = args.last_log_term == my_last_log_term
-            && args.last_log_index >= (self.log.len() as u64);
+            && args.last_log_index >= self.last_log_index_logical();
 
         if cond1 || cond2 {
             return true;
@@ -714,17 +725,6 @@ impl Raft {
         let end_logical = self.last_log_index_logical();
         for i in start_logical..=end_logical {
             log_entries.push(self.log_at_logical(i as usize)?);
-            // .unwrap_or_else(|| {
-            //     rfpanic!(
-            //         self,
-            //         "for peer {} next_index: {:?}, i: {}, start: {}, end: {}",
-            //         peer,
-            //         self.next_index,
-            //         i,
-            //         start_logical,
-            //         end_logical
-            //     );
-            // }));
         }
         rfdebug!(
             self,
@@ -814,6 +814,13 @@ impl Raft {
 
                 let fut = self.peers[i].append_entries(&args);
                 let reply_tx = self.reply_tx.as_ref().unwrap().clone();
+
+                rfdebug!(
+                    self,
+                    "sending append entries to peer {}, next_index: {:?}",
+                    i,
+                    self.next_index
+                );
 
                 self.tp
                     .spawn(async move {
@@ -1287,6 +1294,12 @@ impl Node {
         snapshot: &[u8],
     ) -> bool {
         let mut rf = self.rf.lock().unwrap();
+        rfdebug!(
+            rf,
+            "service calling cond_install_snapshot, lli: {}, llt: {}",
+            last_included_index,
+            last_included_term
+        );
         rf.cond_install_snapshot(last_included_term, last_included_index, snapshot)
     }
 
