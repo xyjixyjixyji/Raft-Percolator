@@ -262,7 +262,6 @@ impl Raft {
         snapshot: &[u8],
     ) -> bool {
         // Your code here (2D).
-        //bugbugbug
         if (last_included_term > self.last_included_term)
             || ((last_included_term == self.last_included_term)
                 && (last_included_index >= self.last_included_index))
@@ -288,6 +287,13 @@ impl Raft {
         // Your code here (2D).
         if self.trim_log_to_logical_included(index, term).is_ok() {
             self.persist_with_snapshot(snapshot);
+            rfdebug!(
+                self,
+                "snapshot: index: {}, commit index: {}, last_applied: {}",
+                index,
+                self.commit_index,
+                self.last_applied,
+            );
             if index >= self.commit_index {
                 self.commit_index = index;
                 self.last_applied = index;
@@ -513,13 +519,16 @@ impl Raft {
             };
             rfinfo!(
                 self,
-                "sending snapshot to service, term {}, index {}, from leader {}",
+                "sending snapshot to service, term {}, index {}, from leader {}, commit index: {}",
                 args.last_included_term,
                 args.last_included_index,
                 args.leader_id,
+                self.commit_index,
             );
             self.reset_timer();
             self.apply_tx.unbounded_send(msg).unwrap();
+            self.last_applied = self.last_applied.max(args.last_included_index);
+            self.commit_index = self.commit_index.max(args.last_included_index);
         }
 
         Ok(InstallSnapshotReply { term: self.term() })
@@ -695,6 +704,14 @@ impl Raft {
         }
         // (last_applied, commit_index]
         let interval = self.last_applied + 1..=self.commit_index;
+        rfdebug!(
+            self,
+            "applying from interval {:?}, last_applied:{}, log length: {}, last_included_index: {}",
+            interval,
+            self.last_applied,
+            self.log.len(),
+            self.last_included_index,
+        );
         for index in interval {
             let msg = ApplyMsg::Command {
                 data: self.data_at_logical(index as usize).unwrap(),
@@ -768,9 +785,10 @@ impl Raft {
     fn trim_log_to_logical_included(&mut self, logical_index: u64, term: u64) -> Result<()> {
         rfinfo!(
             self,
-            "trim log to index {}, my last log index is {}",
+            "trim log to index {}, last log index {}, last included index: {}",
             logical_index,
-            self.last_log_index_logical()
+            self.last_log_index_logical(),
+            self.last_included_index,
         );
 
         if logical_index <= self.last_included_index {
