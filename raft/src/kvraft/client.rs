@@ -1,7 +1,15 @@
-use std::fmt;
+use std::{
+    fmt,
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+use futures::executor::block_on;
 
 use crate::proto::kvraftpb::*;
 
+const OP_UNKNOWN: i32 = 0;
+const OP_PUT: i32 = 1;
+const OP_APPEND: i32 = 2;
 enum Op {
     Put(String, String),
     Append(String, String),
@@ -11,6 +19,8 @@ pub struct Clerk {
     pub name: String,
     pub servers: Vec<KvClient>,
     // You will have to modify this struct.
+    last_leader: AtomicU64,
+    next_reqno: AtomicU64,
 }
 
 impl fmt::Debug for Clerk {
@@ -23,7 +33,12 @@ impl Clerk {
     pub fn new(name: String, servers: Vec<KvClient>) -> Clerk {
         // You'll have to add code here.
         // Clerk { name, servers }
-        crate::your_code_here((name, servers))
+        Clerk {
+            name,
+            servers,
+            last_leader: AtomicU64::new(0),
+            next_reqno: AtomicU64::new(1), // index starts from one
+        }
     }
 
     /// fetch the current value for a key.
@@ -34,7 +49,26 @@ impl Clerk {
     // if let Some(reply) = self.servers[i].get(args).wait() { /* do something */ }
     pub fn get(&self, key: String) -> String {
         // You will have to modify this function.
-        crate::your_code_here(key)
+        let mut index = self.last_leader.load(Ordering::SeqCst);
+        let reqno = self.next_reqno.fetch_add(1, Ordering::SeqCst);
+        let args = GetRequest {
+            key,
+            name: self.name.clone(),
+            reqno,
+        };
+        loop {
+            let fut = self.servers[index as usize].get(&args);
+            //todo: make this async
+            if let Ok(reply) = block_on(fut) {
+                if !reply.wrong_leader {
+                    if reply.err.is_empty() {
+                        self.last_leader.store(index, Ordering::SeqCst);
+                        return reply.value;
+                    }
+                }
+            }
+            index = (index + 1) % (self.servers.len() as u64);
+        }
     }
 
     /// shared by Put and Append.
@@ -43,7 +77,39 @@ impl Clerk {
     // let reply = self.servers[i].put_append(args).unwrap();
     fn put_append(&self, op: Op) {
         // You will have to modify this function.
-        crate::your_code_here(op)
+        let mut index = self.last_leader.load(Ordering::SeqCst);
+        let reqno = self.next_reqno.fetch_add(1, Ordering::SeqCst);
+        let args = match op {
+            Op::Append(key, value) => PutAppendRequest {
+                key,
+                value,
+                op: OP_PUT,
+                name: self.name.clone(),
+                reqno,
+            },
+
+            Op::Put(key, value) => PutAppendRequest {
+                key,
+                value,
+                op: OP_APPEND,
+                name: self.name.clone(),
+                reqno,
+            },
+        };
+
+        loop {
+            let fut = self.servers[index as usize].put_append(&args);
+            //todo: make this async
+            if let Ok(reply) = block_on(fut) {
+                if !reply.wrong_leader {
+                    if reply.err.is_empty() {
+                        self.last_leader.store(index, Ordering::SeqCst);
+                        return;
+                    }
+                }
+            }
+            index = (index + 1) % (self.servers.len() as u64);
+        }
     }
 
     pub fn put(&self, key: String, value: String) {

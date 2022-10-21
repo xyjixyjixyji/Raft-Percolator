@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package kvraftpb;
 
-enum Op {
+enum OpType {
     Unknown = 0;
     Put = 1;
     Append = 2;
@@ -13,8 +13,9 @@ message PutAppendRequest {
     string key = 1;
     string value = 2;
     // "Put" or "Append"
-    Op op = 3;
-    // You'll have to add definitions here.
+    OpType op = 3;
+    string name = 4;
+    uint64 reqno = 5;
 }
 
 message PutAppendReply {
@@ -24,7 +25,8 @@ message PutAppendReply {
 
 message GetRequest {
     string key = 1;
-    // You'll have to add definitions here.
+    string name = 2;
+    uint64 reqno = 3;
 }
 
 message GetReply {
@@ -32,3 +34,18 @@ message GetReply {
     string err = 2;
     string value = 3;
 }
+
+message Op {
+    string key = 1;
+    string value = 2;
+    string op_type = 3;
+    string name = 4;
+    uint64 reqno = 5;
+}
+
+message OpReply {
+    bool wrong_leader = 1;
+    string err = 2;
+    string value = 3;
+}
+
