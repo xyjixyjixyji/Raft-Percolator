@@ -17,6 +17,51 @@ const OP_TYPE_GET: &str = "Get";
 const OP_TYPE_PUT: &str = "Put";
 const OP_TYPE_APPEND: &str = "Append";
 
+#[allow(unused_macros)]
+macro_rules! kvinfo {
+    ($kv:expr, $($args:tt)+) => {
+        info!("kv [me: {}] [term: {}] [is_leader: {:?}], {}",
+              $kv.me,
+              $kv.rf.term(),
+              $kv.rf.is_leader(),
+              format_args!($($args)+));
+    };
+}
+
+#[allow(unused_macros)]
+macro_rules! kvdebug {
+    ($kv:expr, $($args:tt)+) => {
+        debug!("kv [me: {}] [term: {}] [is_leader: {:?}], {}",
+              $kv.me,
+              $kv.rf.term(),
+              $kv.rf.is_leader(),
+              format_args!($($args)+));
+    };
+}
+
+#[allow(unused_macros)]
+macro_rules! kvpanic {
+    ($kv:expr, $($args:tt)+) => {
+        error!("kv [me: {}] [term: {}] [is_leader: {:?}], {}",
+              $kv.me,
+              $kv.rf.term(),
+              $kv.rf.is_leader(),
+              format_args!($($args)+));
+        panic!();
+    };
+}
+
+#[allow(unused_macros)]
+macro_rules! kvwarn {
+    ($kv:expr, $($args:tt)+) => {
+        warn!("kv [me: {}] [term: {}] [is_leader: {:?}], {}",
+              $kv.me,
+              $kv.rf.term(),
+              $kv.rf.is_leader(),
+              format_args!($($args)+));
+    };
+}
+
 impl TryFrom<GetRequest> for Op {
     type Error = ();
     fn try_from(value: GetRequest) -> Result<Self, Self::Error> {
@@ -339,6 +384,7 @@ impl KvService for Node {
         // Your code here.
         let op = Op::try_from(arg).unwrap();
         let mut kv = self.kv.write().unwrap();
+        kvinfo!(kv, "receive GetRequest, Op: {:?}", op);
         Ok(kv.generic_op_handler(op).unwrap().into())
     }
 
@@ -347,6 +393,7 @@ impl KvService for Node {
         // Your code here.
         let op = Op::try_from(arg).unwrap();
         let mut kv = self.kv.write().unwrap();
+        kvinfo!(kv, "receive PutAppendRequest, Op: {:?}", op);
         Ok(kv.generic_op_handler(op).unwrap().into())
     }
 }
