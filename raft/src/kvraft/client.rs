@@ -7,7 +7,6 @@ use futures::executor::block_on;
 
 use crate::proto::kvraftpb::*;
 
-const OP_UNKNOWN: i32 = 0;
 const OP_PUT: i32 = 1;
 const OP_APPEND: i32 = 2;
 enum Op {
@@ -60,11 +59,9 @@ impl Clerk {
             let fut = self.servers[index as usize].get(&args);
             //todo: make this async
             if let Ok(reply) = block_on(fut) {
-                if !reply.wrong_leader {
-                    if reply.err.is_empty() {
-                        self.last_leader.store(index, Ordering::SeqCst);
-                        return reply.value;
-                    }
+                if !reply.wrong_leader && reply.err.is_empty() {
+                    self.last_leader.store(index, Ordering::SeqCst);
+                    return reply.value;
                 }
             }
             index = (index + 1) % (self.servers.len() as u64);
@@ -101,11 +98,9 @@ impl Clerk {
             let fut = self.servers[index as usize].put_append(&args);
             //todo: make this async
             if let Ok(reply) = block_on(fut) {
-                if !reply.wrong_leader {
-                    if reply.err.is_empty() {
-                        self.last_leader.store(index, Ordering::SeqCst);
-                        return;
-                    }
+                if !reply.wrong_leader && reply.err.is_empty() {
+                    self.last_leader.store(index, Ordering::SeqCst);
+                    return;
                 }
             }
             index = (index + 1) % (self.servers.len() as u64);

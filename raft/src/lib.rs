@@ -12,6 +12,7 @@ mod proto;
 pub mod raft;
 
 /// A place holder for suppressing unused_variables warning.
+#[allow(dead_code)]
 fn your_code_here<T>(_: T) -> ! {
     unimplemented!()
 }

@@ -45,7 +45,7 @@ message Op {
 
 message OpReply {
     bool wrong_leader = 1;
-    string err = 2;
-    string value = 3;
+    string err = 3;
+    string value = 4;
 }
 

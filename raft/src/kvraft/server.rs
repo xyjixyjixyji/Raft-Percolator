@@ -1,21 +1,21 @@
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
 
 use futures::channel::mpsc::{unbounded, UnboundedReceiver};
 use futures::channel::oneshot;
 use futures::executor::{block_on, ThreadPool};
-use futures::{select, FutureExt};
-use futures_timer::Delay;
+use futures::task::SpawnExt;
+use futures::StreamExt;
 
 use crate::proto::kvraftpb::*;
 use crate::raft::{self, ApplyMsg};
 
-const COMMAND_TIMEOUT: u64 = 2000;
-const OP_UNKNOWN: i32 = 0;
 const OP_PUT: i32 = 1;
 const OP_APPEND: i32 = 2;
+const OP_TYPE_GET: &str = "Get";
+const OP_TYPE_PUT: &str = "Put";
+const OP_TYPE_APPEND: &str = "Append";
 
 impl TryFrom<GetRequest> for Op {
     type Error = ();
@@ -23,7 +23,7 @@ impl TryFrom<GetRequest> for Op {
         Ok(Op {
             key: value.key,
             value: String::from(""),
-            op_type: "Get".to_string(),
+            op_type: OP_TYPE_GET.to_string(),
             name: value.name,
             reqno: value.reqno,
         })
@@ -33,7 +33,11 @@ impl TryFrom<GetRequest> for Op {
 impl TryFrom<PutAppendRequest> for Op {
     type Error = ();
     fn try_from(value: PutAppendRequest) -> Result<Self, Self::Error> {
-        let op_type = if value.op == OP_PUT { "Put" } else { "Append" };
+        let op_type = match value.op {
+            OP_PUT => OP_TYPE_PUT,
+            OP_APPEND => OP_TYPE_APPEND,
+            _ => panic!("unknown putappend request"),
+        };
 
         Ok(Op {
             key: value.key,
@@ -45,23 +49,29 @@ impl TryFrom<PutAppendRequest> for Op {
     }
 }
 
-impl Into<GetReply> for OpReply {
-    fn into(self) -> GetReply {
-        GetReply {
-            wrong_leader: self.wrong_leader,
-            err: self.err,
-            value: self.value,
+impl From<OpReply> for GetReply {
+    fn from(reply: OpReply) -> Self {
+        Self {
+            wrong_leader: reply.wrong_leader,
+            err: reply.err,
+            value: reply.value,
         }
     }
 }
 
-impl Into<PutAppendReply> for OpReply {
-    fn into(self) -> PutAppendReply {
-        PutAppendReply {
-            wrong_leader: self.wrong_leader,
-            err: self.err,
+impl From<OpReply> for PutAppendReply {
+    fn from(reply: OpReply) -> Self {
+        Self {
+            wrong_leader: reply.wrong_leader,
+            err: reply.err,
         }
     }
+}
+
+/// the term is the available term for this sender
+struct SenderWithTerm {
+    term: u64,
+    sender: oneshot::Sender<OpReply>,
 }
 
 pub struct KvServer {
@@ -70,15 +80,17 @@ pub struct KvServer {
     // snapshot if log grows this big
     maxraftstate: Option<usize>,
     // Your definitions here.
-    apply_rx: UnboundedReceiver<ApplyMsg>,
+    apply_rx: Option<UnboundedReceiver<ApplyMsg>>,
+    _last_applied_index: u64, // snapshot usage
+
+    kv_store: HashMap<String, String>,
     max_reqno_map: HashMap<String, u64>, // <name -> max_reqno>
-    last_applied_index: u64,             // snapshot usage
 
     // event notifying when command done by raft layer
     // logic: Node start polling from apply_rx, and apply() anything from it
     //        the KvServer apply() the command and generate corresponding results to a channel
     //        the channel was polled by RPC handler by node, and returns to client
-    event_signal_map: HashMap<u64, Option<oneshot::Sender<Op>>>, // <index -> receiver>
+    event_signal_map: HashMap<u64, SenderWithTerm>, // <index -> receiver>
 }
 
 impl KvServer {
@@ -97,9 +109,10 @@ impl KvServer {
             rf: raft::Node::new(rf),
             me,
             maxraftstate,
-            apply_rx,
+            apply_rx: Some(apply_rx),
             max_reqno_map: HashMap::new(),
-            last_applied_index: 0,
+            kv_store: HashMap::new(),
+            _last_applied_index: 0,
             event_signal_map: HashMap::new(),
         }
     }
@@ -115,25 +128,120 @@ impl KvServer {
             value: String::from(""),
         };
 
-        // let timer = Delay::new(Duration::from_millis(COMMAND_TIMEOUT)).fuse();
-        let (get_tx, mut get_rx) = oneshot::channel();
+        // messages are handed to apply_rx, and send to apply(msg)
+        // in apply(), it remove filled the get_rx and remove the
+        // event_signal
+        let (get_tx, get_rx) = oneshot::channel();
 
-        if let Ok((index, _term)) = self.rf.start(&op) {
-            self.event_signal_map.insert(index, Some(get_tx));
-            // poll the channel here
-            let op_to_apply = block_on(get_rx).unwrap();
-            self.event_signal_map.remove(&index);
-            self.apply(op_to_apply);
-        } else {
-            // not leader
-            reply.wrong_leader = true;
+        match self.rf.start(&op) {
+            Ok((index, term)) => {
+                assert!(self
+                    .event_signal_map
+                    .insert(
+                        index,
+                        SenderWithTerm {
+                            term,
+                            sender: get_tx
+                        }
+                    )
+                    .is_none());
+                let op_reply = block_on(get_rx).unwrap();
+                reply.err = op_reply.err;
+                // it is possible that I am leader on recving the req, but not anymore when applying
+                reply.wrong_leader = op_reply.wrong_leader;
+            }
+            Err(e) => {
+                assert_eq!(e, raft::errors::Error::NotLeader);
+                reply.wrong_leader = true;
+            }
         }
 
         Ok(reply)
     }
 
-    // apply this to state machine
-    async fn apply(&mut self, op: Op) {}
+    /// Apply this to state machine
+    /// It does following things
+    ///  - if it is a duplicate, just respond to Get
+    ///  - else, apply this msg to the state machine and construct the OpReply
+    ///  - fill the event_signal with the op_reply
+    ///  - NOTE THAT: it is possible that I am not leader now, so it needs to be double checked
+    fn apply(&mut self, msg: ApplyMsg) {
+        let mut reply = OpReply {
+            wrong_leader: false,
+            err: String::from(""),
+            value: String::from(""),
+        };
+        match msg {
+            ApplyMsg::Command { data, index } => {
+                // data is some type of op
+                let op: Op = labcodec::decode(&data).unwrap();
+                let is_dup = self.is_dup(&op);
+                // double check leader
+                if !self.rf.is_leader() {
+                    reply.wrong_leader = true;
+                }
+
+                // operate the Op
+                match op.op_type.as_str() {
+                    OP_TYPE_PUT => {
+                        if !is_dup {
+                            self.kv_store.insert(op.key, op.value);
+                        }
+                    }
+
+                    OP_TYPE_APPEND => {
+                        if !is_dup {
+                            self.kv_store.entry(op.key).or_default().push_str(&op.value);
+                        }
+                    }
+
+                    OP_TYPE_GET => {
+                        let value = self.kv_store.get(&op.key).cloned().unwrap_or_default();
+                        reply.value = value;
+                    }
+
+                    _ => unreachable!(),
+                }
+
+                // put the reply into the event_signal_map
+                if let Some(SenderWithTerm { term, sender }) = self.event_signal_map.remove(&index)
+                {
+                    // stale signal?
+                    if term != self.rf.term() {
+                        reply.wrong_leader = true;
+                        reply.err = "STALE TERM".to_string();
+                    }
+
+                    sender.send(reply).unwrap();
+                } // else i am not leader any more
+
+                // todo: try_snapshot
+            }
+
+            ApplyMsg::Snapshot {
+                data: _,
+                term: _,
+                index: _,
+            } => {
+                unimplemented!();
+            }
+        }
+    }
+}
+
+// utils
+impl KvServer {
+    /// return whether an Op is a duplicate or stale
+    fn is_dup(&mut self, op: &Op) -> bool {
+        let largest_reqno = self.max_reqno_map.entry(op.name.clone()).or_insert(0);
+        // update if larger
+        if op.reqno > *largest_reqno {
+            *largest_reqno = op.reqno;
+            false
+        } else {
+            true
+        }
+    }
 }
 
 impl KvServer {
@@ -167,18 +275,32 @@ pub struct Node {
 }
 
 impl Node {
-    pub fn new(kv: KvServer) -> Node {
+    pub fn new(mut kv: KvServer) -> Node {
+        let apply_rx = kv.apply_rx.take().unwrap();
+
         let mut me = Node {
             kv: Arc::new(RwLock::new(kv)),
             tp: ThreadPool::new().unwrap(),
         };
 
-        me.poll();
+        me.poll(apply_rx);
 
         me
     }
 
-    pub fn poll(&mut self) {}
+    pub fn poll(&mut self, mut apply_rx: UnboundedReceiver<ApplyMsg>) {
+        let kv = Arc::clone(&self.kv);
+
+        self.tp
+            .spawn(async move {
+                loop {
+                    while let Some(msg) = apply_rx.next().await {
+                        kv.write().unwrap().apply(msg);
+                    }
+                }
+            })
+            .unwrap();
+    }
 
     /// the tester calls kill() when a KVServer instance won't
     /// be needed again. you are not required to do anything
@@ -191,6 +313,7 @@ impl Node {
         // self.server.kill();
 
         // Your code here, if desired.
+        self.kv.read().unwrap().rf.kill();
     }
 
     /// The current term of this peer.
@@ -212,8 +335,6 @@ impl Node {
 #[async_trait::async_trait]
 impl KvService for Node {
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
-    // this should start a get in the raft peer, poll from the apply_ch
-    // and reply UNTIL we have an result
     async fn get(&self, arg: GetRequest) -> labrpc::Result<GetReply> {
         // Your code here.
         let op = Op::try_from(arg).unwrap();
