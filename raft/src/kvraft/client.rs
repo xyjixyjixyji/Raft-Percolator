@@ -80,7 +80,7 @@ impl Clerk {
             Op::Append(key, value) => PutAppendRequest {
                 key,
                 value,
-                op: OP_PUT,
+                op: OP_APPEND,
                 name: self.name.clone(),
                 reqno,
             },
@@ -88,7 +88,7 @@ impl Clerk {
             Op::Put(key, value) => PutAppendRequest {
                 key,
                 value,
-                op: OP_APPEND,
+                op: OP_PUT,
                 name: self.name.clone(),
                 reqno,
             },

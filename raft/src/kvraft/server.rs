@@ -4,7 +4,7 @@ use std::sync::{Arc, RwLock};
 
 use futures::channel::mpsc::{unbounded, UnboundedReceiver};
 use futures::channel::oneshot;
-use futures::executor::{block_on, ThreadPool};
+use futures::executor::ThreadPool;
 use futures::task::SpawnExt;
 use futures::StreamExt;
 
@@ -162,48 +162,6 @@ impl KvServer {
         }
     }
 
-    // request handlers start replication at raft peer
-    // raft peer replicates and commit through apply_ch
-    // kvserver's Node run a loop, the loop polls cmd from
-    // apply_ch and handle that
-    fn generic_op_handler(&mut self, op: Op) -> labrpc::Result<OpReply> {
-        let mut reply = OpReply {
-            wrong_leader: false,
-            err: String::from(""),
-            value: String::from(""),
-        };
-
-        // messages are handed to apply_rx, and send to apply(msg)
-        // in apply(), it remove filled the get_rx and remove the
-        // event_signal
-        let (get_tx, get_rx) = oneshot::channel();
-
-        match self.rf.start(&op) {
-            Ok((index, term)) => {
-                assert!(self
-                    .event_signal_map
-                    .insert(
-                        index,
-                        SenderWithTerm {
-                            term,
-                            sender: get_tx
-                        }
-                    )
-                    .is_none());
-                let op_reply = block_on(get_rx).unwrap();
-                reply.err = op_reply.err;
-                // it is possible that I am leader on recving the req, but not anymore when applying
-                reply.wrong_leader = op_reply.wrong_leader;
-            }
-            Err(e) => {
-                assert_eq!(e, raft::errors::Error::NotLeader);
-                reply.wrong_leader = true;
-            }
-        }
-
-        Ok(reply)
-    }
-
     /// Apply this to state machine
     /// It does following things
     ///  - if it is a duplicate, just respond to Get
@@ -230,18 +188,54 @@ impl KvServer {
                 match op.op_type.as_str() {
                     OP_TYPE_PUT => {
                         if !is_dup {
-                            self.kv_store.insert(op.key, op.value);
+                            kvinfo!(
+                                self,
+                                "[index: {}], putting [k: {}, v: {}]",
+                                index,
+                                op.key,
+                                op.value
+                            );
+                            self.kv_store.insert(op.key.clone(), op.value);
+                            kvinfo!(
+                                self,
+                                "After inserting, k: {}, value: {}",
+                                op.key,
+                                self.value_of(&op.key)
+                            );
                         }
                     }
 
                     OP_TYPE_APPEND => {
                         if !is_dup {
-                            self.kv_store.entry(op.key).or_default().push_str(&op.value);
+                            kvinfo!(
+                                self,
+                                "[index: {}], appending [k: {}, v: {}]",
+                                index,
+                                op.key,
+                                op.value
+                            );
+                            self.kv_store
+                                .entry(op.key.clone())
+                                .or_default()
+                                .push_str(&op.value);
+                            kvinfo!(
+                                self,
+                                "After append, k: {}, value: {}",
+                                op.key,
+                                self.value_of(&op.key)
+                            );
                         }
                     }
 
                     OP_TYPE_GET => {
                         let value = self.kv_store.get(&op.key).cloned().unwrap_or_default();
+                        kvinfo!(
+                            self,
+                            "[index: {}] getting [k = {}] [v = {}]",
+                            index,
+                            op.key,
+                            value
+                        );
                         reply.value = value;
                     }
 
@@ -276,6 +270,9 @@ impl KvServer {
 
 // utils
 impl KvServer {
+    fn value_of(&self, key: &str) -> String {
+        self.kv_store.get(key).cloned().unwrap_or_default()
+    }
     /// return whether an Op is a duplicate or stale
     fn is_dup(&mut self, op: &Op) -> bool {
         let largest_reqno = self.max_reqno_map.entry(op.name.clone()).or_insert(0);
@@ -286,6 +283,26 @@ impl KvServer {
         } else {
             true
         }
+    }
+
+    // replicate the Op and insert the sender
+    fn replicate(&mut self, op: Op) -> labrpc::Result<oneshot::Receiver<OpReply>> {
+        let (index, term) = self
+            .rf
+            .start(&op)
+            .map_err(|_| labrpc::Error::Other("NOTLEADER".to_string()))?;
+        let (get_tx, get_rx) = oneshot::channel();
+        assert!(self
+            .event_signal_map
+            .insert(
+                index,
+                SenderWithTerm {
+                    term,
+                    sender: get_tx,
+                }
+            )
+            .is_none());
+        Ok(get_rx)
     }
 }
 
@@ -375,6 +392,30 @@ impl Node {
         // Your code here.
         self.kv.read().unwrap().rf.get_state()
     }
+
+    async fn generic_op_handler(kv: Arc<RwLock<KvServer>>, op: Op) -> OpReply {
+        let mut reply = OpReply {
+            wrong_leader: false,
+            err: String::from(""),
+            value: String::from(""),
+        };
+
+        kvinfo!(kv.read().unwrap(), "recv op: {:?}", op);
+
+        let r = kv.write().unwrap().replicate(op);
+        match r {
+            Ok(rx) => {
+                kvinfo!(kv.read().unwrap(), "waiting on rx");
+                reply = rx.await.unwrap();
+            }
+            Err(e) => {
+                reply.wrong_leader = true;
+                reply.err = e.to_string()
+            }
+        }
+
+        reply
+    }
 }
 
 #[async_trait::async_trait]
@@ -382,18 +423,28 @@ impl KvService for Node {
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
     async fn get(&self, arg: GetRequest) -> labrpc::Result<GetReply> {
         // Your code here.
-        let op = Op::try_from(arg).unwrap();
-        let mut kv = self.kv.write().unwrap();
-        kvinfo!(kv, "receive GetRequest, Op: {:?}", op);
-        Ok(kv.generic_op_handler(op).unwrap().into())
+        let op = Op::try_from(arg.clone()).unwrap();
+        let kv = self.kv.clone();
+        kvinfo!(
+            kv.read().unwrap(),
+            "Before [arg: {:?}], After [op: {:?}]",
+            arg,
+            op
+        );
+        Ok(Self::generic_op_handler(kv, op).await.into())
     }
 
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
     async fn put_append(&self, arg: PutAppendRequest) -> labrpc::Result<PutAppendReply> {
         // Your code here.
-        let op = Op::try_from(arg).unwrap();
-        let mut kv = self.kv.write().unwrap();
-        kvinfo!(kv, "receive PutAppendRequest, Op: {:?}", op);
-        Ok(kv.generic_op_handler(op).unwrap().into())
+        let op = Op::try_from(arg.clone()).unwrap();
+        let kv = self.kv.clone();
+        kvinfo!(
+            kv.read().unwrap(),
+            "Before [arg: {:?}], After [op: {:?}]",
+            arg,
+            op
+        );
+        Ok(Self::generic_op_handler(kv, op).await.into())
     }
 }
