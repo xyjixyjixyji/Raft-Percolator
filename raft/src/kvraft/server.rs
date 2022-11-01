@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::convert::TryFrom;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex};
 
 use futures::channel::mpsc::{unbounded, UnboundedReceiver};
 use futures::channel::oneshot;
@@ -16,6 +16,19 @@ const OP_APPEND: i32 = 2;
 const OP_TYPE_GET: &str = "Get";
 const OP_TYPE_PUT: &str = "Put";
 const OP_TYPE_APPEND: &str = "Append";
+
+#[allow(unused_macros)]
+macro_rules! kvinfo_locked {
+    ($kv:expr, $($args:tt)+) => {
+        let _kv = $kv.lock().unwrap();
+        info!("kv [me: {}] [term: {}] [is_leader: {:?}], {}",
+              _kv.me,
+              _kv.rf.term(),
+              _kv.rf.is_leader(),
+              format_args!($($args)+));
+        drop(_kv);
+    };
+}
 
 #[allow(unused_macros)]
 macro_rules! kvinfo {
@@ -188,54 +201,54 @@ impl KvServer {
                 match op.op_type.as_str() {
                     OP_TYPE_PUT => {
                         if !is_dup {
-                            kvinfo!(
-                                self,
-                                "[index: {}], putting [k: {}, v: {}]",
-                                index,
-                                op.key,
-                                op.value
-                            );
+                            // kvinfo!(
+                            //     self,
+                            //     "[index: {}], putting [k: {}, v: {}]",
+                            //     index,
+                            //     op.key,
+                            //     op.value
+                            // );
                             self.kv_store.insert(op.key.clone(), op.value);
-                            kvinfo!(
-                                self,
-                                "After inserting, k: {}, value: {}",
-                                op.key,
-                                self.value_of(&op.key)
-                            );
+                            // kvinfo!(
+                            //     self,
+                            //     "After inserting, k: {}, value: {}",
+                            //     op.key,
+                            //     self.value_of(&op.key)
+                            // );
                         }
                     }
 
                     OP_TYPE_APPEND => {
                         if !is_dup {
-                            kvinfo!(
-                                self,
-                                "[index: {}], appending [k: {}, v: {}]",
-                                index,
-                                op.key,
-                                op.value
-                            );
+                            // kvinfo!(
+                            //     self,
+                            //     "[index: {}], appending [k: {}, v: {}]",
+                            //     index,
+                            //     op.key,
+                            //     op.value
+                            // );
                             self.kv_store
                                 .entry(op.key.clone())
                                 .or_default()
                                 .push_str(&op.value);
-                            kvinfo!(
-                                self,
-                                "After append, k: {}, value: {}",
-                                op.key,
-                                self.value_of(&op.key)
-                            );
+                            // kvinfo!(
+                            //     self,
+                            //     "After append, k: {}, value: {}",
+                            //     op.key,
+                            //     self.value_of(&op.key)
+                            // );
                         }
                     }
 
                     OP_TYPE_GET => {
                         let value = self.kv_store.get(&op.key).cloned().unwrap_or_default();
-                        kvinfo!(
-                            self,
-                            "[index: {}] getting [k = {}] [v = {}]",
-                            index,
-                            op.key,
-                            value
-                        );
+                        // kvinfo!(
+                        //     self,
+                        //     "[index: {}] getting [k = {}] [v = {}]",
+                        //     index,
+                        //     op.key,
+                        //     value
+                        // );
                         reply.value = value;
                     }
 
@@ -270,6 +283,7 @@ impl KvServer {
 
 // utils
 impl KvServer {
+    #[allow(dead_code)]
     fn value_of(&self, key: &str) -> String {
         self.kv_store.get(key).cloned().unwrap_or_default()
     }
@@ -287,6 +301,7 @@ impl KvServer {
 
     // replicate the Op and insert the sender
     fn replicate(&mut self, op: Op) -> labrpc::Result<oneshot::Receiver<OpReply>> {
+        // kvinfo!(self, "kv starting replicating op: {:?}", op);
         let (index, term) = self
             .rf
             .start(&op)
@@ -332,7 +347,7 @@ impl KvServer {
 #[derive(Clone)]
 pub struct Node {
     // Your definitions here.
-    kv: Arc<RwLock<KvServer>>,
+    kv: Arc<Mutex<KvServer>>,
     tp: ThreadPool,
 }
 
@@ -341,7 +356,7 @@ impl Node {
         let apply_rx = kv.apply_rx.take().unwrap();
 
         let mut me = Node {
-            kv: Arc::new(RwLock::new(kv)),
+            kv: Arc::new(Mutex::new(kv)),
             tp: ThreadPool::new().unwrap(),
         };
 
@@ -357,7 +372,7 @@ impl Node {
             .spawn(async move {
                 loop {
                     while let Some(msg) = apply_rx.next().await {
-                        kv.write().unwrap().apply(msg);
+                        kv.lock().unwrap().apply(msg);
                     }
                 }
             })
@@ -375,7 +390,7 @@ impl Node {
         // self.server.kill();
 
         // Your code here, if desired.
-        self.kv.read().unwrap().rf.kill();
+        self.kv.lock().unwrap().rf.kill();
     }
 
     /// The current term of this peer.
@@ -390,22 +405,21 @@ impl Node {
 
     pub fn get_state(&self) -> raft::State {
         // Your code here.
-        self.kv.read().unwrap().rf.get_state()
+        self.kv.lock().unwrap().rf.get_state()
     }
 
-    async fn generic_op_handler(kv: Arc<RwLock<KvServer>>, op: Op) -> OpReply {
+    async fn generic_op_handler(kv: Arc<Mutex<KvServer>>, op: Op) -> OpReply {
         let mut reply = OpReply {
             wrong_leader: false,
             err: String::from(""),
             value: String::from(""),
         };
 
-        kvinfo!(kv.read().unwrap(), "recv op: {:?}", op);
+        // kvinfo_locked!(kv, "recv {}: {:?}", op.op_type, op);
 
-        let r = kv.write().unwrap().replicate(op);
+        let r = kv.lock().unwrap().replicate(op);
         match r {
             Ok(rx) => {
-                kvinfo!(kv.read().unwrap(), "waiting on rx");
                 reply = rx.await.unwrap();
             }
             Err(e) => {
@@ -425,12 +439,6 @@ impl KvService for Node {
         // Your code here.
         let op = Op::try_from(arg.clone()).unwrap();
         let kv = self.kv.clone();
-        kvinfo!(
-            kv.read().unwrap(),
-            "Before [arg: {:?}], After [op: {:?}]",
-            arg,
-            op
-        );
         Ok(Self::generic_op_handler(kv, op).await.into())
     }
 
@@ -439,12 +447,6 @@ impl KvService for Node {
         // Your code here.
         let op = Op::try_from(arg.clone()).unwrap();
         let kv = self.kv.clone();
-        kvinfo!(
-            kv.read().unwrap(),
-            "Before [arg: {:?}], After [op: {:?}]",
-            arg,
-            op
-        );
         Ok(Self::generic_op_handler(kv, op).await.into())
     }
 }

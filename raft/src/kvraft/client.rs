@@ -65,6 +65,7 @@ impl Clerk {
                 }
             }
             index = (index + 1) % (self.servers.len() as u64);
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
 
@@ -104,6 +105,7 @@ impl Clerk {
                 }
             }
             index = (index + 1) % (self.servers.len() as u64);
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
 
