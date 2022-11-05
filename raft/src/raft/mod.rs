@@ -147,13 +147,17 @@ pub struct Raft {
 
 macro_rules! rfinfo {
     ($raft:expr, $($args:tt)+) => {
-        info!("rf [me: {}] [state: {:?}], {}", $raft.me, $raft.state, format_args!($($args)+));
+        if let Ok(_) = std::env::var("RF") {
+            info!("rf [me: {}] [state: {:?}], {}", $raft.me, $raft.state, format_args!($($args)+));
+        }
     };
 }
 
 macro_rules! rfdebug {
     ($raft:expr, $($args:tt)+) => {
-        debug!("rf [me: {}] [state: {:?}], {}", $raft.me, $raft.state, format_args!($($args)+));
+        if let Ok(_) = std::env::var("RF") {
+            debug!("rf [me: {}] [state: {:?}], {}", $raft.me, $raft.state, format_args!($($args)+));
+        }
     };
 }
 
@@ -540,8 +544,10 @@ impl Raft {
     fn report_debug(&self) {
         rfdebug!(
             self,
-            "REPORTING nextindex: {:?}, lastincludedindex: {}, log length: {}, last log index {}",
+            "REPORTING nextindex: {:?}, matchindex: {:?}, commitindex: {}, lastincludedindex: {}, log length: {}, last log index {}",
             self.next_index,
+            self.match_index,
+            self.commit_index,
             self.last_included_index,
             self.log.len(),
             self.last_log_index_logical(),
@@ -672,7 +678,7 @@ impl Raft {
 
     fn valid_commit_index_from_majority(&self) -> u64 {
         let mut n = self.commit_index;
-        for i in self.commit_index + 1..=self.last_log_index_logical() {
+        for i in (self.commit_index + 1..=self.last_log_index_logical()).rev() {
             // how many peers have >= i?
             let mut nmatches = 1; // me
             for j in 0..self.peers.len() {
@@ -681,14 +687,28 @@ impl Raft {
                 }
             }
 
+            rfinfo!(
+                self,
+                "trying commit index to {}, nmatches = {}",
+                i,
+                nmatches
+            );
+
             // there exists an N, > commit index, majority of matchIndex >== N
             // and log[N].term == currentTerm, set commitIndex = N
-            if (nmatches > (self.peers.len() / 2))
+            if nmatches > (self.peers.len() / 2)
                 && (self.term_at_logical(i as usize) == Some(self.term()))
             {
                 n = i;
                 break;
             }
+
+            rfinfo!(
+                self,
+                "fail to update index to {}, nmatches = {}",
+                i,
+                nmatches
+            );
         }
         n
     }

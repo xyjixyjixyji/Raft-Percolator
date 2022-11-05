@@ -58,6 +58,7 @@ impl Clerk {
         loop {
             let fut = self.servers[index as usize].get(&args);
             //todo: make this async
+            //todo: timeout!!
             if let Ok(reply) = block_on(fut) {
                 if !reply.wrong_leader && reply.err.is_empty() {
                     self.last_leader.store(index, Ordering::SeqCst);

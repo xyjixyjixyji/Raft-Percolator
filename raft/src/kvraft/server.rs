@@ -18,19 +18,6 @@ const OP_TYPE_PUT: &str = "Put";
 const OP_TYPE_APPEND: &str = "Append";
 
 #[allow(unused_macros)]
-macro_rules! kvinfo_locked {
-    ($kv:expr, $($args:tt)+) => {
-        let _kv = $kv.lock().unwrap();
-        info!("kv [me: {}] [term: {}] [is_leader: {:?}], {}",
-              _kv.me,
-              _kv.rf.term(),
-              _kv.rf.is_leader(),
-              format_args!($($args)+));
-        drop(_kv);
-    };
-}
-
-#[allow(unused_macros)]
 macro_rules! kvinfo {
     ($kv:expr, $($args:tt)+) => {
         info!("kv [me: {}] [term: {}] [is_leader: {:?}], {}",
@@ -190,6 +177,7 @@ impl KvServer {
         match msg {
             ApplyMsg::Command { data, index } => {
                 // data is some type of op
+                kvinfo!(self, "apply(): get msg [Index: {}] from apply_ch", index);
                 let op: Op = labcodec::decode(&data).unwrap();
                 let is_dup = self.is_dup(&op);
                 // double check leader
@@ -201,54 +189,21 @@ impl KvServer {
                 match op.op_type.as_str() {
                     OP_TYPE_PUT => {
                         if !is_dup {
-                            // kvinfo!(
-                            //     self,
-                            //     "[index: {}], putting [k: {}, v: {}]",
-                            //     index,
-                            //     op.key,
-                            //     op.value
-                            // );
                             self.kv_store.insert(op.key.clone(), op.value);
-                            // kvinfo!(
-                            //     self,
-                            //     "After inserting, k: {}, value: {}",
-                            //     op.key,
-                            //     self.value_of(&op.key)
-                            // );
                         }
                     }
 
                     OP_TYPE_APPEND => {
                         if !is_dup {
-                            // kvinfo!(
-                            //     self,
-                            //     "[index: {}], appending [k: {}, v: {}]",
-                            //     index,
-                            //     op.key,
-                            //     op.value
-                            // );
                             self.kv_store
                                 .entry(op.key.clone())
                                 .or_default()
                                 .push_str(&op.value);
-                            // kvinfo!(
-                            //     self,
-                            //     "After append, k: {}, value: {}",
-                            //     op.key,
-                            //     self.value_of(&op.key)
-                            // );
                         }
                     }
 
                     OP_TYPE_GET => {
                         let value = self.kv_store.get(&op.key).cloned().unwrap_or_default();
-                        // kvinfo!(
-                        //     self,
-                        //     "[index: {}] getting [k = {}] [v = {}]",
-                        //     index,
-                        //     op.key,
-                        //     value
-                        // );
                         reply.value = value;
                     }
 
@@ -260,6 +215,12 @@ impl KvServer {
                 {
                     // stale signal?
                     if term != self.rf.term() {
+                        kvinfo!(
+                            self,
+                            "apply(): the signal is stale, [term: {:?}], [rf.term(): {:?}]",
+                            term,
+                            self.rf.term()
+                        );
                         reply.wrong_leader = true;
                         reply.err = "STALE TERM".to_string();
                     }
@@ -301,11 +262,16 @@ impl KvServer {
 
     // replicate the Op and insert the sender
     fn replicate(&mut self, op: Op) -> labrpc::Result<oneshot::Receiver<OpReply>> {
-        // kvinfo!(self, "kv starting replicating op: {:?}", op);
         let (index, term) = self
             .rf
             .start(&op)
             .map_err(|_| labrpc::Error::Other("NOTLEADER".to_string()))?;
+        kvinfo!(
+            self,
+            "kv[leader] start replicating [Index: {}] op: {:?}",
+            index,
+            op
+        );
         let (get_tx, get_rx) = oneshot::channel();
         assert!(self
             .event_signal_map
@@ -414,8 +380,6 @@ impl Node {
             err: String::from(""),
             value: String::from(""),
         };
-
-        // kvinfo_locked!(kv, "recv {}: {:?}", op.op_type, op);
 
         let r = kv.lock().unwrap().replicate(op);
         match r {
