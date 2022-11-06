@@ -177,7 +177,9 @@ impl KvServer {
         match msg {
             ApplyMsg::Command { data, index } => {
                 // data is some type of op
+
                 kvinfo!(self, "apply(): get msg [Index: {}] from apply_ch", index);
+
                 let op: Op = labcodec::decode(&data).unwrap();
                 let is_dup = self.is_dup(&op);
                 // double check leader
@@ -189,16 +191,13 @@ impl KvServer {
                 match op.op_type.as_str() {
                     OP_TYPE_PUT => {
                         if !is_dup {
-                            self.kv_store.insert(op.key.clone(), op.value);
+                            self.kv_store.insert(op.key, op.value);
                         }
                     }
 
                     OP_TYPE_APPEND => {
                         if !is_dup {
-                            self.kv_store
-                                .entry(op.key.clone())
-                                .or_default()
-                                .push_str(&op.value);
+                            self.kv_store.entry(op.key).or_default().push_str(&op.value);
                         }
                     }
 
@@ -221,6 +220,7 @@ impl KvServer {
                             term,
                             self.rf.term()
                         );
+
                         reply.wrong_leader = true;
                         reply.err = "STALE TERM".to_string();
                     }
@@ -266,12 +266,14 @@ impl KvServer {
             .rf
             .start(&op)
             .map_err(|_| labrpc::Error::Other("NOTLEADER".to_string()))?;
+
         kvinfo!(
             self,
             "kv[leader] start replicating [Index: {}] op: {:?}",
             index,
             op
         );
+
         let (get_tx, get_rx) = oneshot::channel();
         assert!(self
             .event_signal_map

@@ -253,6 +253,7 @@ impl Raft {
         self.log.push(entry);
         self.reset_timer();
         self.persist();
+        self.fill_heartbeat_chan(); // immediately start a heartbeat
         Ok((self.last_log_index_logical(), self.last_log_term()))
     }
 
@@ -553,6 +554,15 @@ impl Raft {
             self.last_log_index_logical(),
         );
     }
+
+    fn fill_heartbeat_chan(&self) {
+        let _ = self
+            .action_tx
+            .as_ref()
+            .unwrap()
+            .unbounded_send(Actions::SendHeartbeat);
+    }
+
     fn reset_timer(&mut self) {
         self.timer_tx
             .as_ref()

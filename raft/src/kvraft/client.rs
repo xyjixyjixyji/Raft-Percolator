@@ -1,11 +1,15 @@
 use std::{
     fmt,
     sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
 };
 
-use futures::executor::block_on;
+use futures::{executor::block_on, select, FutureExt};
+use futures_timer::Delay;
 
 use crate::proto::kvraftpb::*;
+
+const REQ_TIMEOUT: u64 = 500;
 
 const OP_PUT: i32 = 1;
 const OP_APPEND: i32 = 2;
@@ -47,6 +51,10 @@ impl Clerk {
     // you can send an RPC with code like this:
     // if let Some(reply) = self.servers[i].get(args).wait() { /* do something */ }
     pub fn get(&self, key: String) -> String {
+        block_on(self.real_get(key))
+    }
+
+    pub async fn real_get(&self, key: String) -> String {
         // You will have to modify this function.
         let mut index = self.last_leader.load(Ordering::SeqCst);
         let reqno = self.next_reqno.fetch_add(1, Ordering::SeqCst);
@@ -55,18 +63,30 @@ impl Clerk {
             name: self.name.clone(),
             reqno,
         };
-        loop {
-            let fut = self.servers[index as usize].get(&args);
+        'loop1: loop {
+            let mut fut = self.servers[index as usize].get(&args).fuse();
+            let mut timeout_timer = Delay::new(Duration::from_millis(REQ_TIMEOUT)).fuse();
             //todo: make this async
             //todo: timeout!!
-            if let Ok(reply) = block_on(fut) {
-                if !reply.wrong_leader && reply.err.is_empty() {
-                    self.last_leader.store(index, Ordering::SeqCst);
-                    return reply.value;
+            'loop2: loop {
+                select! {
+                    result = fut => {
+                        match result {
+                            Ok(reply) => {
+                                if !reply.wrong_leader && reply.err.is_empty() {
+                                    self.last_leader.store(index, Ordering::SeqCst);
+                                    break 'loop1 reply.value;
+                                }
+                            }
+                            Err(_) => break 'loop2,
+                        }
+                    }
+
+                    _ = timeout_timer => break 'loop2,
                 }
             }
+
             index = (index + 1) % (self.servers.len() as u64);
-            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
 
@@ -74,7 +94,7 @@ impl Clerk {
     //
     // you can send an RPC with code like this:
     // let reply = self.servers[i].put_append(args).unwrap();
-    fn put_append(&self, op: Op) {
+    async fn put_append(&self, op: Op) {
         // You will have to modify this function.
         let mut index = self.last_leader.load(Ordering::SeqCst);
         let reqno = self.next_reqno.fetch_add(1, Ordering::SeqCst);
@@ -96,25 +116,44 @@ impl Clerk {
             },
         };
 
-        loop {
-            let fut = self.servers[index as usize].put_append(&args);
-            //todo: make this async
-            if let Ok(reply) = block_on(fut) {
-                if !reply.wrong_leader && reply.err.is_empty() {
-                    self.last_leader.store(index, Ordering::SeqCst);
-                    return;
+        'loop1: loop {
+            let mut fut = self.servers[index as usize].put_append(&args).fuse();
+            let mut timeout_timer = Delay::new(Duration::from_millis(REQ_TIMEOUT)).fuse();
+
+            'loop2: loop {
+                select! {
+                    result = fut => {
+                        match result {
+                            Ok(reply) => {
+                                if !reply.wrong_leader && reply.err.is_empty() {
+                                    self.last_leader.store(index, Ordering::SeqCst);
+                                    break 'loop1;
+                                }
+                            }
+                            Err(_) => break 'loop2,
+                        }
+                    }
+
+                    _ = timeout_timer => break 'loop2,
                 }
             }
             index = (index + 1) % (self.servers.len() as u64);
-            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
 
     pub fn put(&self, key: String, value: String) {
-        self.put_append(Op::Put(key, value))
+        block_on(self.put_append(Op::Put(key, value)));
+    }
+
+    pub async fn real_put(&self, key: String, value: String) {
+        self.put_append(Op::Put(key, value)).await
     }
 
     pub fn append(&self, key: String, value: String) {
-        self.put_append(Op::Append(key, value))
+        block_on(self.real_append(key, value));
+    }
+
+    pub async fn real_append(&self, key: String, value: String) {
+        self.put_append(Op::Append(key, value)).await
     }
 }

@@ -188,7 +188,7 @@ impl Network {
         self.core.count.fetch_add(1, Ordering::Relaxed);
         let network = self.clone();
         let end_info = self.end_info(&rpc.client_name);
-        debug!("{:?} process with {:?}", rpc, end_info);
+        // debug!("{:?} process with {:?}", rpc, end_info);
         let EndInfo {
             enabled,
             reliable,
