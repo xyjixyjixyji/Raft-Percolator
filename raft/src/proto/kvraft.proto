@@ -49,3 +49,8 @@ message OpReply {
     string value = 4;
 }
 
+message KvServerNonVolatileState {
+    map<string, string> kv_store = 1;
+    map<string, uint64> max_reqno_map = 2;
+}
+

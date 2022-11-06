@@ -488,8 +488,9 @@ impl Raft {
             );
 
             reply.success = true;
-            self.update_commit_index(args.leader_commit);
-            self.apply();
+            if let Some(index) = self.get_update_commit_index(args.leader_commit) {
+                self.apply_to(index);
+            }
         }
 
         Ok(reply)
@@ -673,17 +674,12 @@ impl Raft {
 
     /// called after the log is replicated from leader, so last_log_index_logical() represends
     /// the index of last new entry
-    fn update_commit_index(&mut self, leader_commit: u64) {
+    fn get_update_commit_index(&mut self, leader_commit: u64) -> Option<u64> {
         if leader_commit > self.commit_index {
-            self.commit_index = std::cmp::min(leader_commit, self.last_log_index_logical())
+            Some(std::cmp::min(leader_commit, self.last_log_index_logical()))
+        } else {
+            None
         }
-        // rfinfo!(
-        //     self,
-        //     "new commit_index: {}, leader commit: {}, my last log index: {}",
-        //     self.commit_index,
-        //     leader_commit,
-        //     self.last_log_index_logical()
-        // );
     }
 
     fn valid_commit_index_from_majority(&self) -> u64 {
@@ -697,13 +693,6 @@ impl Raft {
                 }
             }
 
-            rfinfo!(
-                self,
-                "trying commit index to {}, nmatches = {}",
-                i,
-                nmatches
-            );
-
             // there exists an N, > commit index, majority of matchIndex >== N
             // and log[N].term == currentTerm, set commitIndex = N
             if nmatches > (self.peers.len() / 2)
@@ -712,28 +701,17 @@ impl Raft {
                 n = i;
                 break;
             }
-
-            rfinfo!(
-                self,
-                "fail to update index to {}, nmatches = {}",
-                i,
-                nmatches
-            );
         }
         n
     }
 
-    fn apply(&mut self) {
-        if self.last_applied > self.commit_index {
-            rfwarn!(
-                self,
-                "last_applied {} >= self.commit_index {}???",
-                self.last_applied,
-                self.commit_index
-            );
+    fn apply_to(&mut self, index: u64) {
+        if index <= self.commit_index {
+            return;
         }
-        // (last_applied, commit_index]
-        let interval = self.last_applied + 1..=self.commit_index;
+
+        let interval = self.commit_index + 1..=index;
+
         rfdebug!(
             self,
             "applying from interval {:?}, last_applied:{}, log length: {}, last_included_index: {}",
@@ -742,6 +720,7 @@ impl Raft {
             self.log.len(),
             self.last_included_index,
         );
+
         for index in interval {
             let msg = ApplyMsg::Command {
                 data: self.data_at_logical(index as usize).unwrap(),
@@ -749,20 +728,21 @@ impl Raft {
             };
             rfdebug!(self, "applying Index {}", index);
             self.apply_tx.unbounded_send(msg).unwrap();
-            self.last_applied += 1;
         }
+        self.commit_index = index;
+        self.last_applied = index;
     }
 
     /// advance the commit index to majority's commit index
     /// and if updated, we try to apply that to state machine
     fn advance_commit_index_and_apply(&mut self) {
-        self.commit_index = self.valid_commit_index_from_majority();
+        let commit_index = self.valid_commit_index_from_majority();
         rfdebug!(
             self,
             "successfully advance commit index to {}",
             self.commit_index
         );
-        self.apply();
+        self.apply_to(commit_index);
     }
 
     fn append_entries_args_for(&self, peer: u64) -> Option<AppendEntriesArgs> {
@@ -1264,6 +1244,10 @@ impl Node {
     fn rebuild_timeout_timer() -> Fuse<Delay> {
         let timeout = rand::thread_rng().gen_range(TIMEOUT_MIN, TIMEOUT_MIN * 3);
         Delay::new(Duration::from_millis(timeout)).fuse()
+    }
+
+    pub fn raft_state_size(&self) -> usize {
+        self.rf.lock().unwrap().persister.raft_state().len()
     }
 
     /// the service using Raft (e.g. a k/v server) wants to start

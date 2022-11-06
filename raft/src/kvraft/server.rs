@@ -126,7 +126,6 @@ pub struct KvServer {
     maxraftstate: Option<usize>,
     // Your definitions here.
     apply_rx: Option<UnboundedReceiver<ApplyMsg>>,
-    _last_applied_index: u64, // snapshot usage
 
     kv_store: HashMap<String, String>,
     max_reqno_map: HashMap<String, u64>, // <name -> max_reqno>
@@ -157,7 +156,6 @@ impl KvServer {
             apply_rx: Some(apply_rx),
             max_reqno_map: HashMap::new(),
             kv_store: HashMap::new(),
-            _last_applied_index: 0,
             event_signal_map: HashMap::new(),
         }
     }
@@ -228,15 +226,31 @@ impl KvServer {
                     sender.send(reply).unwrap();
                 } // else i am not leader any more
 
-                // todo: try_snapshot
+                self.try_snapshot(index);
             }
 
-            ApplyMsg::Snapshot {
-                data: _,
-                term: _,
-                index: _,
-            } => {
-                unimplemented!();
+            ApplyMsg::Snapshot { data, term, index } => {
+                // tell raft to cond_install_snapshot, if success, apply the snapshot in state
+                // machine
+                self.rf.cond_install_snapshot(term, index, &data).then(|| {
+                    kvinfo!(
+                        self,
+                        "Installing kvserver's state, [term: {}], [index: {}]",
+                        term,
+                        index
+                    );
+                    match labcodec::decode(&data) {
+                        Ok(nv_state) => {
+                            let nv_state: KvServerNonVolatileState = nv_state;
+                            self.kv_store = nv_state.kv_store;
+                            self.max_reqno_map = nv_state.max_reqno_map;
+                        }
+
+                        Err(_) => {
+                            panic!("failed to deserialize nv_state in KvServer");
+                        }
+                    }
+                });
             }
         }
     }
@@ -248,6 +262,28 @@ impl KvServer {
     fn value_of(&self, key: &str) -> String {
         self.kv_store.get(key).cloned().unwrap_or_default()
     }
+
+    fn pack_nvstate(&self) -> KvServerNonVolatileState {
+        KvServerNonVolatileState {
+            kv_store: self.kv_store.clone(),
+            max_reqno_map: self.max_reqno_map.clone(),
+        }
+    }
+
+    /// try snapshot, by testing the log size with maxraftstate
+    /// the data should be serialized to a [`KvNonVolatileState`]
+    fn try_snapshot(&self, index: u64) {
+        kvinfo!(self, "trying to snapshot");
+        self.maxraftstate.and_then(|mrs| {
+            (self.rf.raft_state_size() >= mrs).then(|| {
+                kvinfo!(self, "KVSERVER: Raft state too large, squeeze log!");
+                let mut buf = vec![];
+                labcodec::encode(&self.pack_nvstate(), &mut buf).unwrap();
+                self.rf.snapshot(index, &buf);
+            })
+        });
+    }
+
     /// return whether an Op is a duplicate or stale
     fn is_dup(&mut self, op: &Op) -> bool {
         let largest_reqno = self.max_reqno_map.entry(op.name.clone()).or_insert(0);
