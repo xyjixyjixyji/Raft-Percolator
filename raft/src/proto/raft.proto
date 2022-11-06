@@ -60,7 +60,6 @@ message RaftNonVolatileState {
   uint64 current_term = 1;
   int64 voted_for = 2;
   repeated LogEntry log = 3;
-  uint64 commit_index = 4;
-  uint64 last_included_index = 5;
-  uint64 last_included_term = 6;
+  uint64 last_included_index = 4;
+  uint64 last_included_term = 5;
 }

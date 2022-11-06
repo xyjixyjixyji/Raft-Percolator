@@ -1063,7 +1063,6 @@ impl Raft {
             current_term: self.term(),
             voted_for: self.voted_for,
             log: self.log.clone(),
-            commit_index: self.commit_index,
             last_included_index: self.last_included_index,
             last_included_term: self.last_included_term,
         }
@@ -1098,9 +1097,11 @@ impl Raft {
                 self.state.term = nv_state.current_term;
                 self.voted_for = nv_state.voted_for as i64;
                 self.log = nv_state.log;
-                self.commit_index = nv_state.commit_index;
                 self.last_included_index = nv_state.last_included_index;
                 self.last_included_term = nv_state.last_included_term;
+
+                self.commit_index = self.last_included_index;
+                self.last_applied = self.last_included_index;
             }
 
             Err(e) => {
@@ -1250,7 +1251,7 @@ impl Node {
     }
 
     pub fn raft_state_size(&self) -> usize {
-        self.rf.lock().unwrap().log.len()
+        self.rf.lock().unwrap().persister.raft_state().len()
     }
 
     /// the service using Raft (e.g. a k/v server) wants to start

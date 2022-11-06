@@ -147,9 +147,11 @@ impl KvServer {
         // You may need initialization code here.
 
         let (apply_tx, apply_rx) = unbounded();
+        let snapshot = persister.snapshot();
+
         let rf = raft::Raft::new(servers, me, persister, apply_tx);
 
-        KvServer {
+        let mut kv = KvServer {
             rf: raft::Node::new(rf),
             me,
             maxraftstate,
@@ -157,6 +159,26 @@ impl KvServer {
             max_reqno_map: HashMap::new(),
             kv_store: HashMap::new(),
             event_signal_map: HashMap::new(),
+        };
+
+        kv.restore(&snapshot);
+
+        kv
+    }
+
+    fn restore(&mut self, snapshot: &[u8]) {
+        if snapshot.is_empty() {
+            return;
+        }
+
+        match labcodec::decode(snapshot) {
+            Ok(nv_state) => {
+                let nv_state: KvServerNonVolatileState = nv_state;
+                self.kv_store = nv_state.kv_store;
+                self.max_reqno_map = nv_state.max_reqno_map;
+            }
+
+            Err(_) => panic!("failed to decode in restore"),
         }
     }
 
@@ -273,19 +295,33 @@ impl KvServer {
     /// try snapshot, by testing the log size with maxraftstate
     /// the data should be serialized to a [`KvNonVolatileState`]
     fn try_snapshot(&self, index: u64) {
-        kvinfo!(self, "trying to snapshot");
-        self.maxraftstate.and_then(|mrs| {
-            (self.rf.raft_state_size() >= mrs).then(|| {
-                kvinfo!(
-                    self,
-                    "KVSERVER: Raft state too large, squeeze log to {}!",
-                    index
-                );
+        let current_state_size = self.rf.raft_state_size();
+        kvinfo!(
+            self,
+            "trying to snapshot to index: {}, cur: {}, max: {:?}",
+            index,
+            current_state_size,
+            self.maxraftstate
+        );
+        if let Some(maxraftstate) = self.maxraftstate {
+            if current_state_size >= maxraftstate {
                 let mut buf = vec![];
                 labcodec::encode(&self.pack_nvstate(), &mut buf).unwrap();
                 self.rf.snapshot(index, &buf);
-            })
-        });
+            }
+        };
+        // self.maxraftstate.and_then(|mrs| {
+        //     (self.rf.raft_state_size() >= mrs).then(|| {
+        //         kvinfo!(
+        //             self,
+        //             "KVSERVER: Raft state too large, squeeze log to {}!",
+        //             index
+        //         );
+        //         let mut buf = vec![];
+        //         labcodec::encode(&self.pack_nvstate(), &mut buf).unwrap();
+        //         self.rf.snapshot(index, &buf);
+        //     })
+        // });
     }
 
     /// return whether an Op is a duplicate or stale
