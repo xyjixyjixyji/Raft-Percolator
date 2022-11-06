@@ -276,7 +276,11 @@ impl KvServer {
         kvinfo!(self, "trying to snapshot");
         self.maxraftstate.and_then(|mrs| {
             (self.rf.raft_state_size() >= mrs).then(|| {
-                kvinfo!(self, "KVSERVER: Raft state too large, squeeze log!");
+                kvinfo!(
+                    self,
+                    "KVSERVER: Raft state too large, squeeze log to {}!",
+                    index
+                );
                 let mut buf = vec![];
                 labcodec::encode(&self.pack_nvstate(), &mut buf).unwrap();
                 self.rf.snapshot(index, &buf);
