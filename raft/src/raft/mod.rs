@@ -60,6 +60,12 @@ impl std::fmt::Debug for Role {
     }
 }
 
+impl std::fmt::Display for AppendEntriesArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "AppendEntriesArgs [term: {}], [leader_id: {}], [leader_commit: {}], [prev_log_index: {}], [prev_log_term: {}], [log_length: {}]", self.term, self.leader_id, self.leader_commit, self.prev_log_index, self.prev_log_term, self.log_entries.len())
+    }
+}
+
 /// State of a raft peer.
 #[derive(Default, Clone, Debug)]
 pub struct State {
@@ -147,17 +153,13 @@ pub struct Raft {
 
 macro_rules! rfinfo {
     ($raft:expr, $($args:tt)+) => {
-        if let Ok(_) = std::env::var("RF") {
-            info!("rf [me: {}] [state: {:?}], {}", $raft.me, $raft.state, format_args!($($args)+));
-        }
+        info!("rf [me: {}] [state: {:?}], {}", $raft.me, $raft.state, format_args!($($args)+));
     };
 }
 
 macro_rules! rfdebug {
     ($raft:expr, $($args:tt)+) => {
-        if let Ok(_) = std::env::var("RF") {
-            debug!("rf [me: {}] [state: {:?}], {}", $raft.me, $raft.state, format_args!($($args)+));
-        }
+        debug!("rf [me: {}] [state: {:?}], {}", $raft.me, $raft.state, format_args!($($args)+));
     };
 }
 
@@ -399,12 +401,14 @@ impl Raft {
         &mut self,
         args: AppendEntriesArgs,
     ) -> labrpc::Result<AppendEntriesReply> {
+        rfinfo!(self, "Handling from {}, args: {}", args.leader_id, args);
         let mut reply = AppendEntriesReply {
             term: self.state.term(),
             success: false,
             conflict_index: 0,
         };
         if args.term < self.state.term() {
+            rfdebug!(self, "success: false due to staled term");
             return Ok(reply);
         }
 
@@ -419,7 +423,7 @@ impl Raft {
         if !self.is_follower() {
             rfpanic!(
                 self,
-                "candidate or leader should never recv append_entries by logic, args: {:?}",
+                "candidate or leader should never recv append_entries by logic, args: {}",
                 args,
             );
         }
@@ -456,6 +460,7 @@ impl Raft {
             } else {
                 0
             };
+            rfdebug!(self, "success: false due to !matches, reply: {:?}", reply);
         } else {
             // the prefix matches, start replicating logs
             let mut consistent_with_leader = true;
@@ -591,6 +596,8 @@ impl Raft {
     }
 
     fn turn_leader(&mut self) {
+        self.next_index = vec![self.last_log_index_logical() + 1; self.peers.len()];
+        self.match_index = vec![0; self.peers.len()];
         self.state.role = Role::Leader;
     }
 
@@ -684,7 +691,13 @@ impl Raft {
 
     fn valid_commit_index_from_majority(&self) -> u64 {
         let mut n = self.commit_index;
-        for i in (self.commit_index + 1..=self.last_log_index_logical()).rev() {
+        rfinfo!(
+            self,
+            "advancing commit index, trying from {} to {}",
+            self.commit_index + 1,
+            self.last_log_index_logical()
+        );
+        for i in self.commit_index + 1..=self.last_log_index_logical() {
             // how many peers have >= i?
             let mut nmatches = 1; // me
             for j in 0..self.peers.len() {
@@ -740,7 +753,7 @@ impl Raft {
         let commit_index = self.valid_commit_index_from_majority();
         rfdebug!(
             self,
-            "successfully advance commit index to {}",
+            "assured advancing commit index to {}",
             self.commit_index
         );
         self.apply_to(commit_index);

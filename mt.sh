@@ -99,7 +99,7 @@ for i in $(seq "$((success + failed + 1))" "$runs"); do
 
     # Run the tester, passing -test.run if necessary
     if [[ -z "$test" ]]; then
-        make LOG_LEVEL=info RUST_TEST_THREADS=${parallelism} test_2 2>"test-${i}.err" >"test-${i}.log" &
+        make LOG_LEVEL=info RUST_TEST_THREADS=${parallelism} test_3 2>"test-${i}.err" >"test-${i}.log" &
         pid=$!
     else
         make LOG_LEVEL=debug RUST_TEST_THREADS=${parallelism} cargo_test_$test 2>"test-${i}.err" >"test-${i}.log" &
