@@ -22,7 +22,7 @@ use self::persister::*;
 use crate::proto::raftpb::*;
 
 const HEARTBEAT_INTERVAL: u64 = 100;
-const TIMEOUT_MIN: u64 = 200;
+const TIMEOUT_MIN: u64 = 350;
 
 /// As each Raft peer becomes aware that successive log entries are committed,
 /// the peer should send an `ApplyMsg` to the service (or tester) on the same
@@ -446,6 +446,11 @@ impl Raft {
             // provide conflict index for leader
             reply.conflict_index = if self.last_log_index_logical() < args.prev_log_index {
                 self.last_log_index_logical() + 1
+            } else if args.prev_log_index < self.last_included_index {
+                // for example, My last_included_index = 100, my log is [101, 102, 103, 104]
+                // and leader has next_index = 90, sending [91, ...., 110]
+                // I should reply with conflict index = last_included index + 1
+                self.last_included_index + 1
             } else if let Some(conflict_term) = term_at_prev_log_index {
                 // ATTENTION: find the first log has the term of [the term of conflicted log]
                 // since the logs before prev_log_index are thought to be sync
@@ -570,11 +575,7 @@ impl Raft {
     }
 
     fn reset_timer(&mut self) {
-        self.timer_tx
-            .as_ref()
-            .unwrap()
-            .unbounded_send(ResetTimer)
-            .unwrap();
+        let _ = self.timer_tx.as_ref().unwrap().unbounded_send(ResetTimer);
     }
 
     fn turn_follower(&mut self, new_term: u64, voted_for: Option<i64>) {
@@ -596,8 +597,8 @@ impl Raft {
     }
 
     fn turn_leader(&mut self) {
-        self.next_index = vec![self.last_log_index_logical() + 1; self.peers.len()];
-        self.match_index = vec![0; self.peers.len()];
+        // self.next_index = vec![self.last_log_index_logical() + 1; self.peers.len()];
+        // self.match_index = vec![0; self.peers.len()];
         self.state.role = Role::Leader;
     }
 
@@ -1186,6 +1187,7 @@ impl Node {
         // when raft needs to handle replies or actions, it sends to these channel, then,
         // the loop polls from these channels and call corresponding handlers
         let mut rf = self.rf.lock().unwrap();
+        let me = rf.me;
         rf.action_tx = Some(action_tx);
         rf.reply_tx = Some(reply_tx);
         rf.reset_timer();
@@ -1206,12 +1208,15 @@ impl Node {
                         }
 
                         _ = kill_rx => {
+                            info!("FUCKFUCKFUCK, RAFT KILLED");
                             break;
                         }
                     }
                 }
+                info!("me: {} FUCKFUCKFUCK, RAFT EXITING", me);
             })
             .unwrap();
+        info!("me: {} START RUNNNING", me);
     }
 
     fn timer(&mut self) {

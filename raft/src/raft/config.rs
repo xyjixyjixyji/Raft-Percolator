@@ -439,7 +439,7 @@ impl Config {
                 future::ready(())
             }
             raft::ApplyMsg::Snapshot { data, index, term } if snapshot => {
-                // debug!("install snapshot {}", index);
+                debug!("rafts [i = {}] install snapshot {}", i, index);
                 if rafts.lock().unwrap()[i]
                     .as_ref()
                     .unwrap()
