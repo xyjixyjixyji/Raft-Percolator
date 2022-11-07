@@ -868,13 +868,11 @@ impl Raft {
                 self.tp
                     .spawn(async move {
                         if let Ok(reply) = fut.await {
-                            reply_tx
-                                .unbounded_send(RepliesFrom::AppendEntries(
-                                    i as u64,
-                                    next_index_on_success,
-                                    reply,
-                                ))
-                                .unwrap()
+                            let _ = reply_tx.unbounded_send(RepliesFrom::AppendEntries(
+                                i as u64,
+                                next_index_on_success,
+                                reply,
+                            ));
                         }
                         // we also need to send the next_index for leader to update
                     })
@@ -897,13 +895,11 @@ impl Raft {
                 self.tp
                     .spawn(async move {
                         if let Ok(reply) = fut.await {
-                            reply_tx
-                                .unbounded_send(RepliesFrom::InstallSnapshot(
-                                    i as u64,
-                                    next_index_on_success,
-                                    reply,
-                                ))
-                                .unwrap()
+                            let _ = reply_tx.unbounded_send(RepliesFrom::InstallSnapshot(
+                                i as u64,
+                                next_index_on_success,
+                                reply,
+                            ));
                         }
                     })
                     .unwrap();
