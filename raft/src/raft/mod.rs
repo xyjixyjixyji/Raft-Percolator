@@ -21,7 +21,7 @@ use self::errors::*;
 use self::persister::*;
 use crate::proto::raftpb::*;
 
-const HEARTBEAT_INTERVAL: u64 = 100;
+const HEARTBEAT_INTERVAL: u64 = 50;
 const TIMEOUT_MIN: u64 = 350;
 
 /// As each Raft peer becomes aware that successive log entries are committed,
@@ -446,11 +446,6 @@ impl Raft {
             // provide conflict index for leader
             reply.conflict_index = if self.last_log_index_logical() < args.prev_log_index {
                 self.last_log_index_logical() + 1
-            } else if args.prev_log_index < self.last_included_index {
-                // for example, My last_included_index = 100, my log is [101, 102, 103, 104]
-                // and leader has next_index = 90, sending [91, ...., 110]
-                // I should reply with conflict index = last_included index + 1
-                self.last_included_index + 1
             } else if let Some(conflict_term) = term_at_prev_log_index {
                 // ATTENTION: find the first log has the term of [the term of conflicted log]
                 // since the logs before prev_log_index are thought to be sync
@@ -597,8 +592,8 @@ impl Raft {
     }
 
     fn turn_leader(&mut self) {
-        // self.next_index = vec![self.last_log_index_logical() + 1; self.peers.len()];
-        // self.match_index = vec![0; self.peers.len()];
+        self.next_index = vec![self.last_log_index_logical() + 1; self.peers.len()];
+        self.match_index = vec![0; self.peers.len()];
         self.state.role = Role::Leader;
     }
 
