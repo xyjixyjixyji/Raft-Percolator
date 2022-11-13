@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::ops::Bound::Included;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::msg::*;
@@ -52,6 +52,15 @@ impl Value {
             Value::Timestamp(ts, _) => *ts,
             Value::Vector(v, _) => panic!("to_timestamp: is vec"),
         }
+    }
+
+    /// the elapsed time
+    pub fn expired(&self, ttl: u64) -> bool {
+        let d = match self {
+            Value::Timestamp(_, i) => i.elapsed(),
+            Value::Vector(_, i) => i.elapsed(),
+        };
+        d > Duration::from_millis(ttl)
     }
 }
 
@@ -136,13 +145,13 @@ impl transaction::Service for MemoryStorage {
     // example get RPC handler.
     async fn get(&self, req: GetRequest) -> labrpc::Result<GetResponse> {
         // Your code here.
-        let bigtable = self.data.lock().unwrap();
+        let mut bigtable = self.data.lock().unwrap();
         loop {
             // there are still pending locks in [0, start_ts]
-            if let Some(((key, ts), value)) =
-                bigtable.read(&req.key, Column::Lock, None, Some(req.start_ts))
-            {
-                self.back_off_maybe_clean_up_lock(req.start_ts, &req.key);
+            let lock = bigtable.read(&req.key, Column::Lock, None, Some(req.start_ts));
+            if lock.is_some() {
+                bigtable =
+                    MemoryStorage::back_off_maybe_clean_up_lock(bigtable, req.start_ts, &req.key);
                 continue;
             }
 
@@ -245,7 +254,77 @@ impl transaction::Service for MemoryStorage {
 }
 
 impl MemoryStorage {
-    fn back_off_maybe_clean_up_lock(&self, start_ts: u64, key: &[u8]) {
+    fn back_off_maybe_clean_up_lock<'a>(
+        mut bigtable: MutexGuard<'a, KvTable>,
+        start_ts: u64,
+        key: &[u8],
+    ) -> MutexGuard<'a, KvTable> {
         // Your code here.
+        // look up the lock conflicting with current request
+        // the request starts at start_ts, so we look up lock before that
+        let lock = bigtable
+            .read(key, Column::Lock, None, Some(start_ts))
+            .map(|(k, v)| (k.to_owned(), v.to_owned()));
+
+        if let Value::Vector(primary_key, time) = lock.unwrap().1 {
+            let is_primary = primary_key == key;
+            if is_primary {
+                // primary lock is conflict, try to remove this
+                if bigtable.try_remove_expired_lock(start_ts, &primary_key) {
+                    // the lock has been removed, and we need to backoff the transaction
+                    bigtable.erase(key, Column::Data, start_ts);
+                } else {
+                    // todo: exponentially back off to wait
+                }
+            } else {
+                // secondary lock is conflict, find its primary
+                let primary_lock = bigtable.read(key, Column::Lock, Some(start_ts), Some(start_ts));
+                if primary_lock.is_some() {
+                    // rollback primary
+                    if bigtable.try_remove_expired_lock(start_ts, &primary_key) {
+                        bigtable.erase(&primary_key, Column::Data, start_ts);
+                    }
+                } else {
+                    // primary is not locked
+                    //  1. the previous transaction has not commited(and will not be able to commit right now)
+                    //  2. the previous transaction has already commited
+                    if let Some(((_, commit_ts), _)) = bigtable
+                        .read(&primary_key, Column::Write, Some(start_ts), None)
+                        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                    {
+                        // the previous transaction has already committed, therefore, this secondary is supposed to be committed
+                        bigtable.write(
+                            key,
+                            Column::Write,
+                            commit_ts,
+                            Value::Timestamp(start_ts, Instant::now()),
+                        );
+                    }
+                    // in both cases, we remove the lock on the key
+                    //  1. if already commited, we help it commit and erase the lock
+                    //  2. if will not committed, the lock should appear as if never set
+                    bigtable.erase(key, Column::Lock, start_ts);
+                }
+            }
+            bigtable
+        } else {
+            panic!("value in lock column should always be a key")
+        }
+    }
+}
+
+impl KvTable {
+    /// return @removed: whether the lock is expired and REMOVED
+    fn try_remove_expired_lock(&mut self, start_ts: u64, key: &[u8]) -> bool {
+        if let Some(lock) = self.read(key, Column::Lock, Some(start_ts), Some(start_ts)) {
+            if lock.1.expired(TTL) {
+                // if expired, we remove the lock
+                self.erase(key, Column::Lock, start_ts);
+                return true;
+            }
+        }
+
+        // no lock removed by me
+        false
     }
 }
