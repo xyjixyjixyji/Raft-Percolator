@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::ops::Bound::Included;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::msg::*;
 use crate::service::*;
@@ -35,22 +35,22 @@ pub type Key = (Vec<u8>, u64);
 
 #[derive(Clone, PartialEq)]
 pub enum Value {
-    Timestamp(u64),
-    Vector(Vec<u8>),
+    Timestamp(u64, Instant),
+    Vector(Vec<u8>, Instant),
 }
 
 impl Value {
     fn to_vec(&self) -> Vec<u8> {
         match self {
-            Value::Timestamp(ts) => panic!("to_vec: is ts"),
-            Value::Vector(v) => v.to_vec(),
+            Value::Timestamp(ts, _) => panic!("to_vec: is ts"),
+            Value::Vector(v, _) => v.to_vec(),
         }
     }
 
     fn to_timestamp(&self) -> u64 {
         match self {
-            Value::Timestamp(ts) => *ts,
-            Value::Vector(v) => panic!("to_timestamp: is vec"),
+            Value::Timestamp(ts, _) => *ts,
+            Value::Vector(v, _) => panic!("to_timestamp: is vec"),
         }
     }
 }
@@ -184,8 +184,18 @@ impl transaction::Service for MemoryStorage {
             // case2: abort on locks at any ts
             false
         } else {
-            bigtable.write(&w.key, Column::Data, ts, Value::Vector(w.value));
-            bigtable.write(&w.key, Column::Lock, ts, Value::Vector(primary.key));
+            bigtable.write(
+                &w.key,
+                Column::Data,
+                ts,
+                Value::Vector(w.value, Instant::now()),
+            );
+            bigtable.write(
+                &w.key,
+                Column::Lock,
+                ts,
+                Value::Vector(primary.key, Instant::now()),
+            );
             true
         };
 
@@ -195,65 +205,40 @@ impl transaction::Service for MemoryStorage {
     // example commit RPC handler.
     async fn commit(&self, req: CommitRequest) -> labrpc::Result<CommitResponse> {
         // Your code here.
-        let CommitRequest {
-            writes,
-            start_ts,
-            commit_ts,
-        } = req;
-        let primary = writes.first().unwrap().to_owned();
-        let secondaries = writes[1..].to_owned();
-
-        // prewrite the primary
-        let primary_pw_req = PrewriteRequest {
-            ts: start_ts,
-            w: Some(primary.clone()),
-            primary: Some(primary.clone()),
-        };
-        if !self.prewrite(primary_pw_req).await.unwrap().ok {
-            return Ok(CommitResponse { ok: false });
-        }
-
-        // prewrite the secondaries
-        for secondary in secondaries.iter() {
-            let pw_req = PrewriteRequest {
-                ts: start_ts,
-                w: Some(secondary.clone()),
-                primary: Some(primary.clone()),
-            };
-            if !self.prewrite(pw_req).await.unwrap().ok {
-                return Ok(CommitResponse { ok: false });
-            }
-        }
 
         // commit primary, the record can logically be seen after we write the "Write" column
         // start the bigtable txn
         let mut bigtable = self.data.lock().unwrap();
-        // abort while working, cause the cell is not locked
-        if bigtable
-            .read(&primary.key, Column::Lock, Some(start_ts), Some(start_ts))
-            .is_none()
-        {
+
+        let CommitRequest {
+            is_primary,
+            commit_key,
+            start_ts,
+            commit_ts,
+        } = req;
+
+        // if is primary, we have to check if the primary is locked
+        let primary_locked = if is_primary {
+            bigtable
+                .read(&commit_key, Column::Lock, Some(start_ts), Some(start_ts))
+                .is_some()
+        } else {
+            true
+        };
+
+        if !primary_locked {
             return Ok(CommitResponse { ok: false });
         }
-        // logically commit the primary
+
+        // commit the record and erase the lock
         bigtable.write(
-            &primary.key,
+            &commit_key,
             Column::Write,
             commit_ts,
-            Value::Timestamp(start_ts),
+            Value::Timestamp(start_ts, Instant::now()),
         );
-        bigtable.erase(&primary.key, Column::Lock, start_ts);
-
-        // commit the secondaries, and we are safe to say that the secondaries are locked
-        for secondary in secondaries.into_iter() {
-            bigtable.write(
-                &secondary.key,
-                Column::Write,
-                commit_ts,
-                Value::Timestamp(start_ts),
-            );
-            bigtable.erase(&secondary.key, Column::Lock, start_ts);
-        }
+        // todo: paper said it should be commit_ts, I doubt that
+        bigtable.erase(&commit_key, Column::Lock, start_ts);
 
         Ok(CommitResponse { ok: true })
     }
@@ -262,6 +247,5 @@ impl transaction::Service for MemoryStorage {
 impl MemoryStorage {
     fn back_off_maybe_clean_up_lock(&self, start_ts: u64, key: &[u8]) {
         // Your code here.
-        unimplemented!()
     }
 }

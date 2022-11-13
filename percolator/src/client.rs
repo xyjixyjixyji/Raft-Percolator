@@ -108,21 +108,78 @@ impl Client {
 
     async fn real_commit(&mut self) -> Result<bool> {
         assert!(self.txn.is_some(), "must begin a txn when commit");
-        let commit_ts = self.get_timestamp().unwrap();
         let Txn { ts, writes } = self.txn.as_ref().unwrap().to_owned();
+        let start_ts = ts;
 
         if writes.is_empty() {
             return Ok(true);
         }
 
-        self.txn_client
-            .commit(&CommitRequest {
-                writes,
-                start_ts: ts,
-                commit_ts,
-            })
+        // designate the primary and secondaries
+        let primary = writes.first().unwrap().to_owned();
+        let secondaries = writes[1..].to_owned();
+
+        // prewrite the primary
+        let primary_pw_req = PrewriteRequest {
+            ts: start_ts,
+            w: Some(primary.clone()),
+            primary: Some(primary.clone()),
+        };
+        if !self.txn_client.prewrite(&primary_pw_req).await.unwrap().ok {
+            return Ok(false);
+        }
+
+        // prewrite the secondaries
+        for secondary in secondaries.iter() {
+            let pw_req = PrewriteRequest {
+                ts: start_ts,
+                w: Some(secondary.clone()),
+                primary: Some(primary.clone()),
+            };
+            if !self.txn_client.prewrite(&pw_req).await.unwrap().ok {
+                return Ok(false);
+            }
+        }
+
+        let commit_ts = self.real_get_timestamp().await.unwrap();
+
+        // commit the primary
+        let primary_commit_req = CommitRequest {
+            is_primary: true,
+            commit_key: primary.key,
+            start_ts,
+            commit_ts,
+        };
+        if !self
+            .txn_client
+            .commit(&primary_commit_req)
             .await
-            .map(|resp| resp.ok)
+            .unwrap()
+            .ok
+        {
+            return Ok(false);
+        }
+
+        // commit the secondaries
+        for secondary in secondaries.into_iter() {
+            let secondary_commit_req = CommitRequest {
+                is_primary: false,
+                commit_key: secondary.key,
+                start_ts,
+                commit_ts,
+            };
+            if !self
+                .txn_client
+                .commit(&secondary_commit_req)
+                .await
+                .unwrap()
+                .ok
+            {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
     }
 }
 
