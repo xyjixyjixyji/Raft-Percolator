@@ -144,40 +144,46 @@ impl Client {
         let commit_ts = self.real_get_timestamp().await.unwrap();
 
         // commit the primary
+        info!(
+            "commit primary, start_ts: {:?}, commit_ts: {:?}",
+            start_ts, commit_ts
+        );
+
         let primary_commit_req = CommitRequest {
             is_primary: true,
             commit_key: primary.key,
             start_ts,
             commit_ts,
         };
-        if !self
-            .txn_client
-            .commit(&primary_commit_req)
-            .await
-            .unwrap()
-            .ok
-        {
-            return Ok(false);
+        // only if success and resp.ok we proceed
+        let r = auto_retry(|| self.txn_client.commit(&primary_commit_req)).await;
+        info!("txn_client.commit response {:?}", &r);
+        match r {
+            Ok(CommitResponse { ok: false }) => return Ok(false),
+            Ok(_) => {}
+            Err(Error::Other(reason)) if reason == "reqhook" => return Ok(false),
+            Err(e) => return Err(e),
         }
+
+        info!("primary committed");
 
         // commit the secondaries
         for secondary in secondaries.into_iter() {
+            info!(
+                "commit secondary, start_ts: {:?}, commit_rs: {:?}",
+                start_ts, commit_ts
+            );
             let secondary_commit_req = CommitRequest {
                 is_primary: false,
                 commit_key: secondary.key,
                 start_ts,
                 commit_ts,
             };
-            if !self
-                .txn_client
-                .commit(&secondary_commit_req)
-                .await
-                .unwrap()
-                .ok
-            {
-                return Ok(false);
-            }
+            // secondaries commit, even if dropped we see it as success
+            let _ = auto_retry(|| self.txn_client.commit(&secondary_commit_req)).await;
+            info!("secondary committed");
         }
+        info!("all secondary committed");
 
         Ok(true)
     }
@@ -187,13 +193,12 @@ async fn auto_retry<T, F>(f: impl Fn() -> F) -> Result<T>
 where
     F: Future<Output = Result<T>>,
 {
-    let mut r = f().await;
     for i in 0..RETRY_TIMES {
-        match r {
-            Ok(_) => return r,
-            Err(_) => sleep(Duration::from_millis(BACKOFF_TIME_MS)).await,
+        let r = f().await;
+        if r.is_ok() {
+            return r;
         }
-        r = f().await;
+        sleep(Duration::from_millis(BACKOFF_TIME_MS << i)).await;
     }
-    r
+    f().await
 }

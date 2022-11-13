@@ -60,7 +60,8 @@ impl Value {
             Value::Timestamp(_, i) => i.elapsed(),
             Value::Vector(_, i) => i.elapsed(),
         };
-        d > Duration::from_millis(ttl)
+        info!("d: {:?}, ttl: {:?}", d, ttl);
+        d > Duration::from_nanos(ttl)
     }
 }
 
@@ -148,10 +149,11 @@ impl transaction::Service for MemoryStorage {
         let mut bigtable = self.data.lock().unwrap();
         loop {
             // there are still pending locks in [0, start_ts]
-            let lock = bigtable.read(&req.key, Column::Lock, None, Some(req.start_ts));
-            if lock.is_some() {
-                bigtable =
-                    MemoryStorage::back_off_maybe_clean_up_lock(bigtable, req.start_ts, &req.key);
+            let lock = bigtable
+                .read(&req.key, Column::Lock, None, Some(req.start_ts))
+                .map(|(k, v)| (k.to_owned(), v.to_owned()));
+            if let Some(((_, ts), _)) = lock {
+                bigtable = MemoryStorage::back_off_maybe_clean_up_lock(bigtable, ts, &req.key);
                 continue;
             }
 
@@ -199,6 +201,8 @@ impl transaction::Service for MemoryStorage {
                 ts,
                 Value::Vector(w.value, Instant::now()),
             );
+
+            info!("locking on key: {:?}, ts: {}", format_key(&w.key), ts);
             bigtable.write(
                 &w.key,
                 Column::Lock,
@@ -226,8 +230,17 @@ impl transaction::Service for MemoryStorage {
             commit_ts,
         } = req;
 
+        info!(
+            "server: commiting primary: {}, key: {:?}, start_ts: {}, commit_ts: {}",
+            is_primary,
+            commit_key.iter().map(|k| *k as char).collect::<Vec<_>>(),
+            start_ts,
+            commit_ts
+        );
+
         // if is primary, we have to check if the primary is locked
         let primary_locked = if is_primary {
+            info!("server: commiting primary");
             bigtable
                 .read(&commit_key, Column::Lock, Some(start_ts), Some(start_ts))
                 .is_some()
@@ -235,6 +248,7 @@ impl transaction::Service for MemoryStorage {
             true
         };
 
+        info!("server: primary locked {}", primary_locked);
         if !primary_locked {
             return Ok(CommitResponse { ok: false });
         }
@@ -247,6 +261,11 @@ impl transaction::Service for MemoryStorage {
             Value::Timestamp(start_ts, Instant::now()),
         );
         // todo: paper said it should be commit_ts, I doubt that
+        info!(
+            "unlocking on key: {:?}, ts: {}",
+            format_key(&commit_key),
+            start_ts
+        );
         bigtable.erase(&commit_key, Column::Lock, start_ts);
 
         Ok(CommitResponse { ok: true })
@@ -256,54 +275,85 @@ impl transaction::Service for MemoryStorage {
 impl MemoryStorage {
     fn back_off_maybe_clean_up_lock<'a>(
         mut bigtable: MutexGuard<'a, KvTable>,
-        start_ts: u64,
+        ts: u64,
         key: &[u8],
     ) -> MutexGuard<'a, KvTable> {
         // Your code here.
+        info!(
+            "backing off and maybe clean up lock, req.key: {:?}",
+            key.iter().map(|b| *b as char).collect::<Vec<_>>(),
+        );
         // look up the lock conflicting with current request
         // the request starts at start_ts, so we look up lock before that
         let lock = bigtable
-            .read(key, Column::Lock, None, Some(start_ts))
+            .read(key, Column::Lock, None, Some(ts))
             .map(|(k, v)| (k.to_owned(), v.to_owned()));
 
         if let Value::Vector(primary_key, time) = lock.unwrap().1 {
             let is_primary = primary_key == key;
             if is_primary {
+                info!("Backing off a primary");
                 // primary lock is conflict, try to remove this
-                if bigtable.try_remove_expired_lock(start_ts, &primary_key) {
+                if bigtable.try_remove_expired_lock(ts, &primary_key) {
                     // the lock has been removed, and we need to backoff the transaction
-                    bigtable.erase(key, Column::Data, start_ts);
+                    bigtable.erase(key, Column::Data, ts);
                 } else {
                     // todo: exponentially back off to wait
                 }
             } else {
+                info!(
+                    "Backing off a secondary, ts: {}, primary: {:?}",
+                    ts,
+                    &primary_key.iter().map(|c| *c as char).collect::<Vec<_>>()
+                );
                 // secondary lock is conflict, find its primary
-                let primary_lock = bigtable.read(key, Column::Lock, Some(start_ts), Some(start_ts));
+                info!(
+                    "Checking lock of key {:?} on range [{}, {}]",
+                    format_key(key),
+                    ts,
+                    ts
+                );
+                let primary_lock = bigtable.read(&primary_key, Column::Lock, Some(ts), Some(ts));
                 if primary_lock.is_some() {
                     // rollback primary
-                    if bigtable.try_remove_expired_lock(start_ts, &primary_key) {
-                        bigtable.erase(&primary_key, Column::Data, start_ts);
+                    info!("Primary is locked");
+                    if bigtable.try_remove_expired_lock(ts, &primary_key) {
+                        info!("Stale lock removed");
+                        bigtable.erase(&primary_key, Column::Data, ts);
                     }
                 } else {
+                    info!("Primary is not locked");
                     // primary is not locked
                     //  1. the previous transaction has not commited(and will not be able to commit right now)
                     //  2. the previous transaction has already commited
                     if let Some(((_, commit_ts), _)) = bigtable
-                        .read(&primary_key, Column::Write, Some(start_ts), None)
+                        .read(&primary_key, Column::Write, Some(ts), None)
                         .map(|(k, v)| (k.to_owned(), v.to_owned()))
                     {
+                        info!(
+                            "Commiting the key: {:?} on ts: {} by writing to Column::write",
+                            key.iter().map(|c| *c as char).collect::<Vec<_>>(),
+                            ts
+                        );
+
                         // the previous transaction has already committed, therefore, this secondary is supposed to be committed
                         bigtable.write(
                             key,
                             Column::Write,
                             commit_ts,
-                            Value::Timestamp(start_ts, Instant::now()),
+                            Value::Timestamp(ts, Instant::now()),
                         );
                     }
                     // in both cases, we remove the lock on the key
                     //  1. if already commited, we help it commit and erase the lock
                     //  2. if will not committed, the lock should appear as if never set
-                    bigtable.erase(key, Column::Lock, start_ts);
+                    info!(
+                        "Erasing the lock on key: {:?}, ts: {}",
+                        key.iter().map(|c| *c as char).collect::<Vec<_>>(),
+                        ts
+                    );
+
+                    bigtable.erase(key, Column::Lock, ts);
                 }
             }
             bigtable
@@ -327,4 +377,8 @@ impl KvTable {
         // no lock removed by me
         false
     }
+}
+
+fn format_key(key: &[u8]) -> Vec<char> {
+    key.iter().map(|c| *c as char).collect()
 }
